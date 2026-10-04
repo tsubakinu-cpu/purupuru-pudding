@@ -338,6 +338,20 @@ const DEFAULT_CONFIG = Object.freeze({
   maxStepVelocity: 34,
 });
 
+const MOTION_TUNING = Object.freeze({
+  minimumLandingSpeed: 155,
+  highFallSpeed: 300,
+  highFallDistanceFactor: 0.78,
+  highFallMinimumDistance: 72,
+  minimumLandingSteps: 4,
+  highFallMinimumSteps: 8,
+  landingCooldown: 0.95,
+  supportMaximumGap: 4,
+  supportMinimumOverlapFactor: 0.28,
+  nearbyHorizontalFactor: 0.8,
+  nearbyVerticalFactor: 0.72,
+});
+
 const EPSILON = 1e-7;
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -375,6 +389,8 @@ function makeParticle(x, y, invMass = 1) {
     y,
     px: x,
     py: y,
+    renderX: x,
+    renderY: y,
     invMass,
     baseInvMass: invMass,
     floorStep: -1,
@@ -485,6 +501,25 @@ function isFiniteParticle(point) {
     && Number.isFinite(point.py);
 }
 
+function normalizedBodyAxes(body) {
+  const right = body.particles[5];
+  const left = body.particles[11];
+  const top = body.particles[2];
+  const bottom = body.particles[8];
+  const horizontalX = right.x - left.x;
+  const horizontalY = right.y - left.y;
+  const verticalX = bottom.x - top.x;
+  const verticalY = bottom.y - top.y;
+  const horizontalLength = Math.max(EPSILON, Math.hypot(horizontalX, horizontalY));
+  const verticalLength = Math.max(EPSILON, Math.hypot(verticalX, verticalY));
+  return {
+    ux: horizontalX / horizontalLength,
+    uy: horizontalY / horizontalLength,
+    vx: verticalX / verticalLength,
+    vy: verticalY / verticalLength,
+  };
+}
+
 function createBody(id, x, y, width, height, variant, createdAt) {
   const particles = [makeParticle(x, y, 0.72)];
   for (const rest of REST_RING) {
@@ -517,9 +552,17 @@ function createBody(id, x, y, width, height, variant, createdAt) {
     constraints,
     restArea: polygonArea(particles.slice(1)),
     contactCount: 0,
+    contactBodyIds: new Set(),
     impactSpeed: 0,
+    stepVelocityY: 0,
     isGrounded: false,
+    isSupported: false,
+    supportBodyId: null,
     airborneSteps: 0,
+    airborneStartY: y,
+    fallDistance: 0,
+    maximumFallSpeed: 0,
+    isScared: false,
     lastImpactAt: -Infinity,
     dragPointer: null,
     expression: "neutral",
@@ -527,6 +570,9 @@ function createBody(id, x, y, width, height, variant, createdAt) {
     followupExpression: null,
     followupUntil: 0,
     pokeDeformation: null,
+    elasticShape: null,
+    sadLanding: null,
+    landingStabilizer: null,
   };
 }
 
@@ -582,12 +628,16 @@ function solveAreaConstraint(body) {
   }
 }
 
-function translateParticle(point, dx, dy, preserveVelocity = true) {
+function translateParticle(point, dx, dy, preserveVelocity = true, preserveRenderState = false) {
   point.x += dx;
   point.y += dy;
   if (preserveVelocity) {
     point.px += dx;
     point.py += dy;
+  }
+  if (preserveRenderState) {
+    point.renderX += dx;
+    point.renderY += dy;
   }
 }
 
@@ -711,6 +761,9 @@ class SoftBodyWorld {
     center.px = center.x;
     center.py = center.y;
     body.dragPointer = pointerId;
+    body.isScared = false;
+    body.sadLanding = null;
+    body.landingStabilizer = null;
     this.drags.set(pointerId, drag);
     return body;
   }
@@ -739,6 +792,7 @@ class SoftBodyWorld {
     }
     center.px = center.x;
     center.py = center.y;
+    if (!options.cancel) this.applyReleaseWobble(drag.body, drag.lastMoveX, drag.lastMoveY);
     drag.body.dragPointer = null;
     this.drags.delete(pointerId);
     this.events.push({ type: options.cancel ? "drag-cancel" : "released", bodyId: drag.body.id, time: this.time });
@@ -790,7 +844,7 @@ class SoftBodyWorld {
       });
       const moveX = nx * amount * entry.weight;
       const moveY = ny * amount * entry.weight;
-      translateParticle(point, moveX, moveY, true);
+      translateParticle(point, moveX, moveY, true, true);
     }
     body.pokeDeformation = {
       startedAt: this.time,
@@ -815,6 +869,10 @@ class SoftBodyWorld {
   expressionFor(bodyOrId) {
     const body = this.getBody(bodyOrId);
     if (!body) return "neutral";
+    if (body.isScared) return "eek";
+    if (body.sadLanding
+      && this.time >= body.sadLanding.startAt
+      && this.time <= body.sadLanding.endAt) return "sad";
     if (this.time <= body.expressionUntil) return body.expression;
     if (body.followupExpression && this.time <= body.followupUntil) return body.followupExpression;
     return "neutral";
@@ -880,6 +938,10 @@ class SoftBodyWorld {
       }
       if (bounds.maxY > newFloor) nudgeY = newFloor - bounds.maxY;
       for (const point of body.particles) translateParticle(point, nudgeX, nudgeY, true);
+      for (const point of body.particles) {
+        point.renderX = point.x;
+        point.renderY = point.y;
+      }
     }
   }
 
@@ -891,9 +953,18 @@ class SoftBodyWorld {
 
     for (const body of this.bodies) {
       body.contactCount = 0;
+      body.contactBodyIds.clear();
       body.impactSpeed = 0;
+      const center = body.particles[0];
+      body.stepVelocityY = (center.y - center.py) / safeDt;
+      for (const point of body.particles) {
+        point.renderX = point.x;
+        point.renderY = point.y;
+      }
+      this.updateTransientStates(body, safeDt);
       this.integrateBody(body, safeDt);
     }
+    this.applyDragLag();
 
     for (let iteration = 0; iteration < this.config.iterations; iteration += 1) {
       this.applyDragTargets();
@@ -901,12 +972,14 @@ class SoftBodyWorld {
         for (const constraint of body.constraints) solveDistanceConstraint(body, constraint);
         solveAreaConstraint(body);
         this.solvePokeDeformation(body);
+        this.solveTransientShape(body);
       }
       this.solveBodyCollisions();
       for (const body of this.bodies) this.solveBounds(body, safeDt);
     }
 
     this.applyDragTargets(true);
+    this.applyDragPose();
     this.finishContacts();
     this.recoverInvalidBodies();
   }
@@ -941,10 +1014,214 @@ class SoftBodyWorld {
       if (finalPass) {
         center.px = targetX;
         center.py = targetY;
-        drag.lastMoveX *= 0.35;
-        drag.lastMoveY *= 0.35;
       }
     }
+  }
+
+  applyDragPose() {
+    for (const drag of this.drags.values()) {
+      const movementLength = Math.hypot(drag.lastMoveX, drag.lastMoveY);
+      if (movementLength >= 0.2) {
+        const directionX = drag.lastMoveX / movementLength;
+        const directionY = drag.lastMoveY / movementLength;
+        const maximumLag = Math.min(drag.body.height * 0.075, movementLength * 0.3);
+        for (let index = 1; index < drag.body.particles.length; index += 1) {
+          const upperWeight = clamp((-REST_RING[index - 1].y + 0.08) / 0.6, 0, 1);
+          if (upperWeight <= 0) continue;
+          translateParticle(
+            drag.body.particles[index],
+            -directionX * maximumLag * upperWeight,
+            -directionY * maximumLag * upperWeight,
+            true,
+          );
+        }
+      }
+      drag.lastMoveX *= 0.42;
+      drag.lastMoveY *= 0.42;
+    }
+  }
+
+  applyDragLag() {
+    for (const drag of this.drags.values()) {
+      const center = drag.body.particles[0];
+      const targetX = clamp(
+        drag.targetX + drag.offsetX,
+        drag.body.width * 0.45,
+        this.width - drag.body.width * 0.45,
+      );
+      const targetY = clamp(
+        drag.targetY + drag.offsetY,
+        drag.body.height * 0.45,
+        this.floorY - drag.body.height * 0.26,
+      );
+      const movementX = targetX - center.x;
+      const movementY = targetY - center.y;
+      const movementLength = Math.hypot(movementX, movementY);
+      if (movementLength < 0.2) continue;
+      const lagDistance = Math.min(movementLength * 0.16, drag.body.height * 0.12);
+      const directionX = movementX / movementLength;
+      const directionY = movementY / movementLength;
+      for (let index = 1; index < drag.body.particles.length; index += 1) {
+        const rest = REST_RING[index - 1];
+        const upperWeight = clamp((-rest.y + 0.08) / 0.6, 0, 1);
+        const lag = lagDistance * (0.18 + upperWeight * 0.82);
+        translateParticle(
+          drag.body.particles[index],
+          movementX - directionX * lag,
+          movementY - directionY * lag,
+          true,
+        );
+      }
+    }
+  }
+
+  applyReleaseWobble(body, movementX, movementY) {
+    const motionX = clamp(movementX, -16, 16);
+    const motionY = clamp(movementY, -16, 16);
+    if (Math.hypot(motionX, motionY) < 0.5) return;
+    for (let index = 1; index < body.particles.length; index += 1) {
+      const rest = REST_RING[index - 1];
+      const upperWeight = clamp((-rest.y + 0.1) / 0.62, 0, 1);
+      const counterWeight = (1 - upperWeight) * -0.16;
+      const weight = upperWeight + counterWeight;
+      const point = body.particles[index];
+      point.px -= motionX * 0.055 * weight;
+      point.py -= motionY * 0.055 * weight;
+    }
+  }
+
+  updateTransientStates(body, dt) {
+    if (body.landingStabilizer) {
+      const stabilizer = body.landingStabilizer;
+      if (this.time > stabilizer.endAt) {
+        body.landingStabilizer = null;
+      } else {
+        const center = body.particles[0];
+        const correctionX = clamp((stabilizer.anchorX - center.x) * 0.14, -1.4, 1.4);
+        for (const point of body.particles) {
+          translateParticle(point, correctionX, 0, true);
+          const velocityX = point.x - point.px;
+          point.px = point.x - velocityX * 0.52;
+        }
+      }
+    }
+    if (body.elasticShape) {
+      const state = body.elasticShape;
+      state.velocity += (-220 * state.value - 8.2 * state.velocity) * dt;
+      state.value += state.velocity * dt;
+      state.age += dt;
+      if (!Number.isFinite(state.value)
+        || state.age > 1.05
+        || (state.age > 0.72 && Math.abs(state.value) < 0.009 && Math.abs(state.velocity) < 0.08)) {
+        body.elasticShape = null;
+      }
+    }
+    if (body.sadLanding && this.time > body.sadLanding.endAt) {
+      body.sadLanding = null;
+      this.startElasticShape(body, -0.13);
+    }
+  }
+
+  sadEnvelope(body) {
+    if (!body.sadLanding
+      || this.time < body.sadLanding.startAt
+      || this.time > body.sadLanding.endAt) return 0;
+    const progress = clamp(
+      (this.time - body.sadLanding.startAt) / (body.sadLanding.endAt - body.sadLanding.startAt),
+      0,
+      1,
+    );
+    return Math.pow(Math.sin(progress * Math.PI), 0.72);
+  }
+
+  solveTransientShape(body) {
+    const elasticValue = body.elasticShape?.value ?? 0;
+    const sadValue = this.sadEnvelope(body);
+    const squash = clamp(elasticValue + sadValue * 1.28, -0.55, 1.45);
+    if (Math.abs(squash) < 0.002) return;
+
+    const axes = normalizedBodyAxes(body);
+    const center = body.particles[0];
+    const horizontalScale = 1 + squash * 0.09;
+    const verticalScale = 1 - squash * 0.15;
+    const strength = sadValue > 0 ? 0.09 : 0.052;
+    for (let index = 0; index < REST_RING.length; index += 1) {
+      const rest = REST_RING[index];
+      const targetX = center.x
+        + axes.ux * rest.x * body.width * horizontalScale
+        + axes.vx * rest.y * body.height * verticalScale;
+      const targetY = center.y
+        + axes.uy * rest.x * body.width * horizontalScale
+        + axes.vy * rest.y * body.height * verticalScale;
+      const point = body.particles[index + 1];
+      point.x += (targetX - point.x) * strength;
+      point.y += (targetY - point.y) * strength;
+    }
+  }
+
+  startElasticShape(body, amplitude) {
+    const safeAmplitude = clamp(amplitude, -0.5, 1.15);
+    if (body.elasticShape) {
+      body.elasticShape.value = clamp(body.elasticShape.value + safeAmplitude, -0.55, 1.25);
+      body.elasticShape.velocity *= 0.35;
+      body.elasticShape.age = 0;
+      return;
+    }
+    body.elasticShape = { value: safeAmplitude, velocity: 0, age: 0 };
+  }
+
+  applyLandingResponse(body, intensity, role = "lander") {
+    const roleScale = role === "support" ? 0.62 : 1;
+    const power = clamp(intensity, 0.2, 1) * roleScale;
+    this.startElasticShape(body, 0.74 * power);
+    for (let index = 0; index < REST_RING.length; index += 1) {
+      const rest = REST_RING[index];
+      const point = body.particles[index + 1];
+      const sideWeight = Math.abs(rest.x) / 0.52;
+      const lowerWeight = clamp((rest.y + 0.08) / 0.59, 0, 1);
+      const outward = Math.sign(rest.x) * sideWeight * 1.05 * power;
+      const lift = (0.24 + (1 - lowerWeight) * 0.48) * power;
+      point.px -= outward;
+      point.py += lift;
+    }
+    const center = body.particles[0];
+    center.py += 0.42 * power;
+  }
+
+  findSupportingBody(body) {
+    const bounds = bodyAabb(body);
+    let best = null;
+    let bestScore = Infinity;
+    for (const candidate of this.bodies) {
+      if (candidate === body) continue;
+      if (candidate.particles[0].y <= body.particles[0].y + body.height * 0.28) continue;
+      const candidateBounds = bodyAabb(candidate);
+      const horizontalOverlap = Math.min(bounds.maxX, candidateBounds.maxX)
+        - Math.max(bounds.minX, candidateBounds.minX);
+      const minimumOverlap = Math.min(body.width, candidate.width)
+        * MOTION_TUNING.supportMinimumOverlapFactor;
+      if (horizontalOverlap < minimumOverlap) continue;
+      const verticalGap = candidateBounds.minY - bounds.maxY;
+      const knownContact = body.contactBodyIds.has(candidate.id);
+      if (!knownContact
+        && (verticalGap < -body.height * 0.2 || verticalGap > MOTION_TUNING.supportMaximumGap)) continue;
+      const score = Math.abs(verticalGap) + Math.abs(candidate.particles[0].x - body.particles[0].x) * 0.01;
+      if (score < bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  hasNearbyCompanion(body) {
+    return this.bodies.some((candidate) => {
+      if (candidate === body) return false;
+      const horizontalRange = (body.width + candidate.width) * MOTION_TUNING.nearbyHorizontalFactor;
+      const verticalRange = (body.height + candidate.height) * MOTION_TUNING.nearbyVerticalFactor;
+      return Math.abs(candidate.particles[0].x - body.particles[0].x) <= horizontalRange
+        && Math.abs(candidate.particles[0].y - body.particles[0].y) <= verticalRange;
+    });
   }
 
   solvePokeDeformation(body) {
@@ -952,6 +1229,17 @@ class SoftBodyWorld {
     if (!deformation) return;
     const progress = (this.time - deformation.startedAt) / deformation.duration;
     if (progress >= 1) {
+      const center = body.particles[0];
+      for (const entry of deformation.points) {
+        const point = body.particles[entry.index];
+        const dx = point.x - center.x;
+        const dy = point.y - center.y;
+        const length = Math.hypot(dx, dy);
+        if (length < EPSILON) continue;
+        const kick = clamp(entry.indentation * 0.38, 0.7, 5.2);
+        point.px -= dx / length * kick;
+        point.py -= dy / length * kick;
+      }
       body.pokeDeformation = null;
       return;
     }
@@ -1063,28 +1351,123 @@ class SoftBodyWorld {
     };
     moveContacts(contactsA, -1, moveA);
     moveContacts(contactsB, 1, moveB);
+    bodyA.contactBodyIds.add(bodyB.id);
+    bodyB.contactBodyIds.add(bodyA.id);
     bodyA.contactCount += contactsA.length;
     bodyB.contactCount += contactsB.length;
   }
 
   finishContacts() {
-    for (const body of this.bodies) {
-      const groundedNow = bodyRing(body).some((point) => point.y >= this.floorY - 0.75);
-      if (groundedNow
-        && body.airborneSteps >= 4
-        && body.impactSpeed > 175
-        && this.time - body.lastImpactAt > 0.3) {
-        body.lastImpactAt = this.time;
-        this.setExpression(body, "surprised", 0.28, "sly", 0.62);
-        this.events.push({
-          type: "landed",
-          bodyId: body.id,
-          intensity: clamp(body.impactSpeed / 620, 0.2, 1),
-          time: this.time,
-        });
+    const states = this.bodies.map((body) => ({
+      body,
+      grounded: bodyRing(body).some((point) => point.y >= this.floorY - 0.75),
+      support: this.findSupportingBody(body),
+    }));
+
+    for (const state of states) {
+      const { body } = state;
+      const center = body.particles[0];
+      if (body.dragPointer !== null) {
+        body.isGrounded = false;
+        body.isSupported = false;
+        body.supportBodyId = null;
+        body.airborneSteps = 0;
+        body.airborneStartY = center.y;
+        body.fallDistance = 0;
+        body.maximumFallSpeed = 0;
+        body.isScared = false;
+        continue;
       }
-      body.airborneSteps = groundedNow ? 0 : body.airborneSteps + 1;
-      body.isGrounded = groundedNow;
+
+      const supportedNow = state.grounded || Boolean(state.support);
+      if (!supportedNow) {
+        if (body.isSupported || body.airborneSteps === 0) {
+          body.airborneStartY = center.y;
+          body.fallDistance = 0;
+          body.maximumFallSpeed = 0;
+        }
+        body.airborneSteps += 1;
+        body.fallDistance = Math.max(body.fallDistance, center.y - body.airborneStartY);
+        body.maximumFallSpeed = Math.max(body.maximumFallSpeed, body.stepVelocityY);
+        const eekDistance = Math.max(
+          MOTION_TUNING.highFallMinimumDistance * 0.72,
+          body.height * MOTION_TUNING.highFallDistanceFactor * 0.72,
+        );
+        if (body.airborneSteps >= 6
+          && body.fallDistance >= eekDistance
+          && body.maximumFallSpeed >= MOTION_TUNING.highFallSpeed * 0.8) {
+          body.isScared = true;
+        }
+      } else {
+        const landedNow = !body.isSupported
+          && body.airborneSteps >= MOTION_TUNING.minimumLandingSteps;
+        const impactSpeed = Math.max(
+          body.impactSpeed,
+          body.maximumFallSpeed,
+          body.stepVelocityY,
+        );
+        const highFallDistance = Math.max(
+          MOTION_TUNING.highFallMinimumDistance,
+          body.height * MOTION_TUNING.highFallDistanceFactor,
+        );
+        const highFall = body.airborneSteps >= MOTION_TUNING.highFallMinimumSteps
+          && body.fallDistance >= highFallDistance
+          && body.maximumFallSpeed >= MOTION_TUNING.highFallSpeed;
+
+        if (landedNow
+          && impactSpeed >= MOTION_TUNING.minimumLandingSpeed
+          && this.time - body.lastImpactAt > MOTION_TUNING.landingCooldown) {
+          body.lastImpactAt = this.time;
+          const intensity = clamp(impactSpeed / 630, 0.24, 1);
+          this.applyLandingResponse(body, intensity, "lander");
+          this.setExpression(body, "surprised", 0.24, "sly", 0.58);
+
+          if (state.support) {
+            this.applyLandingResponse(state.support, intensity, "support");
+            state.support.sadLanding = null;
+            state.support.isScared = false;
+            this.setExpression(state.support, "surprised", 0.16, "sly", 0.46);
+          }
+
+          const aloneOnFloor = highFall
+            && state.grounded
+            && !state.support
+            && !this.hasNearbyCompanion(body);
+          if (aloneOnFloor) {
+            body.sadLanding = {
+              startAt: this.time + 0.18,
+              endAt: this.time + 0.74,
+            };
+            body.landingStabilizer = {
+              anchorX: center.x,
+              endAt: this.time + 1.05,
+            };
+            this.events.push({ type: "solo-sad", bodyId: body.id, time: this.time + 0.18 });
+          } else {
+            body.sadLanding = null;
+            body.landingStabilizer = null;
+          }
+
+          this.events.push({
+            type: "landed",
+            bodyId: body.id,
+            intensity,
+            highFall,
+            supportBodyId: state.support?.id ?? null,
+            time: this.time,
+          });
+        }
+
+        body.airborneSteps = 0;
+        body.airborneStartY = center.y;
+        body.fallDistance = 0;
+        body.maximumFallSpeed = 0;
+        body.isScared = false;
+      }
+
+      body.isGrounded = state.grounded;
+      body.isSupported = supportedNow;
+      body.supportBodyId = state.support?.id ?? null;
     }
   }
 
@@ -1122,6 +1505,13 @@ class SoftBodyWorld {
         restArea: body.restArea,
         bounds: bodyAabb(body),
         contactCount: body.contactCount,
+        isGrounded: body.isGrounded,
+        isSupported: body.isSupported,
+        supportBodyId: body.supportBodyId,
+        fallDistance: body.fallDistance,
+        maximumFallSpeed: body.maximumFallSpeed,
+        elasticValue: body.elasticShape?.value ?? 0,
+        sadLandingActive: Boolean(body.sadLanding),
         expression: this.expressionFor(body),
         particles: body.particles.map((point) => ({ x: point.x, y: point.y, px: point.px, py: point.py })),
       })),
@@ -1210,6 +1600,14 @@ const PLACEHOLDER_COLORS = [
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
+}
+
+function interpolatePoint(point, alpha, target = { x: 0, y: 0 }) {
+  const previousX = Number.isFinite(point.renderX) ? point.renderX : point.x;
+  const previousY = Number.isFinite(point.renderY) ? point.renderY : point.y;
+  target.x = previousX + (point.x - previousX) * alpha;
+  target.y = previousY + (point.y - previousY) * alpha;
+  return target;
 }
 
 function expandedTriangle(points, amount = 1.15) {
@@ -1334,6 +1732,7 @@ class PuddingRenderer {
     this.spriteAsset = PUDDING_SPRITE;
     this.debug = options.debug ?? false;
     this.lowPower = options.lowPower ?? false;
+    this.bodyViews = new WeakMap();
   }
 
   setSprite(result) {
@@ -1357,13 +1756,32 @@ class PuddingRenderer {
     this.canvas.style.height = `${this.height}px`;
   }
 
-  render(world) {
+  displayBody(body, interpolationAlpha) {
+    let record = this.bodyViews.get(body);
+    if (!record) {
+      const particles = body.particles.map((point) => ({ x: point.x, y: point.y }));
+      const view = Object.create(body);
+      Object.defineProperty(view, "particles", { value: particles });
+      record = { view, particles };
+      this.bodyViews.set(body, record);
+    }
+    const alpha = body.dragPointer === null ? interpolationAlpha : 1;
+    for (let index = 0; index < body.particles.length; index += 1) {
+      interpolatePoint(body.particles[index], alpha, record.particles[index]);
+    }
+    return record.view;
+  }
+
+  render(world, interpolationAlpha = 1) {
     const context = this.context;
     context.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     context.clearRect(0, 0, this.width, this.height);
     this.drawBackdrop(world);
 
-    const bodies = [...world.bodies].sort((a, b) => a.particles[0].y - b.particles[0].y);
+    const alpha = clamp(interpolationAlpha, 0, 1);
+    const bodies = world.bodies
+      .map((body) => this.displayBody(body, alpha))
+      .sort((a, b) => a.particles[0].y - b.particles[0].y);
     for (const body of bodies) this.drawShadow(body, world.floorY);
     for (const body of bodies) {
       if (this.sprite && this.deformationMetric(body) < 2.15 && !this.debug) this.drawAffineSprite(body);
@@ -1553,6 +1971,27 @@ class PuddingRenderer {
       context.moveTo(mouthA.x, mouthA.y);
       context.quadraticCurveTo(mouthMid.x, mouthMid.y, mouthB.x, mouthB.y);
       context.stroke();
+    } else if (expression === "sad") {
+      context.beginPath();
+      context.arc(leftEye.x, leftEye.y + 1.5 * eyeScale, 2.45 * eyeScale, 0, Math.PI * 2);
+      context.arc(rightEye.x, rightEye.y + 1.5 * eyeScale, 2.45 * eyeScale, 0, Math.PI * 2);
+      context.fill();
+      const mouthA = mapLocalPoint(body, -0.04, 0.175);
+      const mouthB = mapLocalPoint(body, 0.04, 0.175);
+      const mouthMid = mapLocalPoint(body, 0, 0.145);
+      context.beginPath();
+      context.moveTo(mouthA.x, mouthA.y);
+      context.quadraticCurveTo(mouthMid.x, mouthMid.y, mouthB.x, mouthB.y);
+      context.stroke();
+    } else if (expression === "eek") {
+      context.beginPath();
+      context.ellipse(leftEye.x, leftEye.y, 3.2 * eyeScale, 4.5 * eyeScale, 0, 0, Math.PI * 2);
+      context.ellipse(rightEye.x, rightEye.y, 3.2 * eyeScale, 4.5 * eyeScale, 0, 0, Math.PI * 2);
+      context.stroke();
+      const mouth = mapLocalPoint(body, 0, 0.155);
+      context.beginPath();
+      context.ellipse(mouth.x, mouth.y, 3.7 * eyeScale, 5.8 * eyeScale, 0, 0, Math.PI * 2);
+      context.fill();
     } else if (expression === "sly") {
       drawLine(context, mapLocalPoint(body, -0.15, 0.06), mapLocalPoint(body, -0.075, 0.068));
       drawLine(context, mapLocalPoint(body, 0.075, 0.068), mapLocalPoint(body, 0.15, 0.055));
@@ -1606,19 +2045,74 @@ class PuddingRenderer {
   }
 }
 
-const rendererMath = Object.freeze({ affineForTriangle, barycentric, mapLocalPoint });
+const rendererMath = Object.freeze({ affineForTriangle, barycentric, mapLocalPoint, interpolatePoint });
 
 return { PuddingRenderer, rendererMath };
 })();
 const { PuddingRenderer } = RendererModule;
 
+const TimingModule = (() => {
+const FRAME_TIMING = Object.freeze({
+  fixedStep: 1 / 60,
+  maximumFrameDelta: 0.05,
+  maximumSubsteps: 4,
+});
+
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+class FixedStepClock {
+  constructor(options = {}) {
+    this.fixedStep = options.fixedStep ?? FRAME_TIMING.fixedStep;
+    this.maximumFrameDelta = options.maximumFrameDelta ?? FRAME_TIMING.maximumFrameDelta;
+    this.maximumSubsteps = options.maximumSubsteps ?? FRAME_TIMING.maximumSubsteps;
+    this.accumulator = 0;
+    this.lastFrameAt = null;
+  }
+
+  reset(now = 0) {
+    this.accumulator = 0;
+    this.lastFrameAt = Number.isFinite(now) ? now : 0;
+  }
+
+  advance(now, step) {
+    const safeNow = Number.isFinite(now) ? now : (this.lastFrameAt ?? 0);
+    if (this.lastFrameAt === null) {
+      this.reset(safeNow);
+      return { elapsed: 0, steps: 0, alpha: 1, dropped: false };
+    }
+
+    const elapsed = clamp((safeNow - this.lastFrameAt) / 1000, 0, this.maximumFrameDelta);
+    this.lastFrameAt = safeNow;
+    this.accumulator += elapsed;
+    let steps = 0;
+    while (this.accumulator + 1e-10 >= this.fixedStep && steps < this.maximumSubsteps) {
+      step(this.fixedStep);
+      this.accumulator -= this.fixedStep;
+      steps += 1;
+    }
+
+    const dropped = steps === this.maximumSubsteps && this.accumulator >= this.fixedStep;
+    if (dropped) this.accumulator %= this.fixedStep;
+    if (this.accumulator < 1e-10) this.accumulator = 0;
+    return {
+      elapsed,
+      steps,
+      alpha: clamp(this.accumulator / this.fixedStep, 0, 1),
+      dropped,
+    };
+  }
+}
+
+return { FRAME_TIMING, FixedStepClock };
+})();
+const { FixedStepClock } = TimingModule;
 
 
 
 
-const FIXED_STEP = 1 / 60;
-const MAX_FRAME_DELTA = 0.05;
-const MAX_SUBSTEPS = 4;
+
 
 class PuddingToy {
   constructor(root) {
@@ -1637,8 +2131,8 @@ class PuddingToy {
     });
     this.audio = new ToyAudio();
     this.pointers = new Map();
-    this.accumulator = 0;
-    this.lastFrameAt = performance.now();
+    this.clock = new FixedStepClock();
+    this.clock.reset(performance.now());
     this.frameRequest = 0;
     this.running = false;
     this.resizeObserver = null;
@@ -1804,10 +2298,10 @@ class PuddingToy {
     if (document.hidden) {
       this.cancelPointers();
       this.world.setPaused(true);
-      this.accumulator = 0;
+      this.clock.reset(performance.now());
     } else {
       this.world.setPaused(false);
-      this.lastFrameAt = performance.now();
+      this.clock.reset(performance.now());
     }
   }
 
@@ -1841,7 +2335,7 @@ class PuddingToy {
     if (this.running) return;
     this.running = true;
     this.world.start();
-    this.lastFrameAt = performance.now();
+    this.clock.reset(performance.now());
     this.frameRequest = requestAnimationFrame(this.tick);
   }
 
@@ -1855,17 +2349,11 @@ class PuddingToy {
 
   tick(now) {
     if (!this.running) return;
-    const elapsed = Math.min(MAX_FRAME_DELTA, Math.max(0, (now - this.lastFrameAt) / 1000));
-    this.lastFrameAt = now;
+    let frame = { alpha: 1 };
     if (!this.world.paused) {
-      this.accumulator += elapsed;
-      let substeps = 0;
-      while (this.accumulator >= FIXED_STEP && substeps < MAX_SUBSTEPS) {
-        this.world.step(FIXED_STEP);
-        this.accumulator -= FIXED_STEP;
-        substeps += 1;
-      }
-      if (substeps === MAX_SUBSTEPS) this.accumulator = 0;
+      frame = this.clock.advance(now, (step) => this.world.step(step));
+    } else {
+      this.clock.reset(now);
     }
 
     if (this.lastRenderBodyCount !== this.world.bodies.length) {
@@ -1873,7 +2361,7 @@ class PuddingToy {
       this.syncControls();
     }
     this.audio.handle(this.world.consumeEvents());
-    this.renderer.render(this.world);
+    this.renderer.render(this.world, frame.alpha);
     this.frameRequest = requestAnimationFrame(this.tick);
   }
 
