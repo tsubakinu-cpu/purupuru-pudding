@@ -1986,6 +1986,8 @@ class PuddingRenderer {
     } else if (expression === "eek") {
       context.beginPath();
       context.ellipse(leftEye.x, leftEye.y, 3.2 * eyeScale, 4.5 * eyeScale, 0, 0, Math.PI * 2);
+      context.stroke();
+      context.beginPath();
       context.ellipse(rightEye.x, rightEye.y, 3.2 * eyeScale, 4.5 * eyeScale, 0, 0, Math.PI * 2);
       context.stroke();
       const mouth = mapLocalPoint(body, 0, 0.155);
