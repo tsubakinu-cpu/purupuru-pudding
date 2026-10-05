@@ -635,6 +635,10 @@ function createBody(id, x, y, width, height, variant, createdAt) {
     twoGripStretch: 1,
     twoGripAxis: null,
     twoGripRestAxes: null,
+    twoGripPose: null,
+    actualStretch: 1,
+    isStretchCrying: false,
+    stretchCryUntil: 0,
   };
 }
 
@@ -650,7 +654,7 @@ function solveDistanceConstraint(body, constraint) {
   if (weight < EPSILON) return;
 
   let restLength = constraint.rest;
-  if ((body.floorCompression > 0.002 && body.floorAxes) || body.twoGripStretch > 1.002) {
+  if ((body.floorCompression > 0.002 && body.floorAxes) || Math.abs(body.twoGripStretch - 1) > 0.002) {
     const localA = constraint.a === 0 ? { x: 0, y: 0 } : REST_RING[constraint.a - 1];
     const localB = constraint.b === 0 ? { x: 0, y: 0 } : REST_RING[constraint.b - 1];
     const axes = body.twoGripRestAxes ?? body.floorAxes;
@@ -676,7 +680,7 @@ function solveDistanceConstraint(body, constraint) {
 function solveAreaConstraint(body) {
   const ring = bodyRing(body);
   const currentArea = polygonArea(ring);
-  const difference = currentArea - body.restArea;
+  const difference = currentArea - body.restArea * Math.sqrt(body.twoGripStretch);
   if (!Number.isFinite(difference) || Math.abs(difference) < 0.001) return;
 
   const gradients = [];
@@ -721,11 +725,31 @@ function floorScales(body) {
 }
 
 function twoGripVector(body, x, y) {
-  if (!body.twoGripAxis || body.twoGripStretch <= 1.002) return { x, y };
+  if (!body.twoGripAxis || Math.abs(body.twoGripStretch - 1) <= 0.002) return { x, y };
   const axis = body.twoGripAxis, parallel = x * axis.x + y * axis.y;
   const perpendicularX = x - axis.x * parallel, perpendicularY = y - axis.y * parallel;
-  return { x:axis.x * parallel * body.twoGripStretch + perpendicularX / body.twoGripStretch,
-    y:axis.y * parallel * body.twoGripStretch + perpendicularY / body.twoGripStretch };
+  const thickness = Math.sqrt(body.twoGripStretch);
+  return { x:axis.x * parallel * body.twoGripStretch + perpendicularX / thickness,
+    y:axis.y * parallel * body.twoGripStretch + perpendicularY / thickness };
+}
+
+// Largest principal strain of two neighboring material elements. Undo floor
+// compression first so a normal squash is not mistaken for painful pulling.
+function materialStretch(body) {
+  const center=body.particles[0],scales=floorScales(body),strains=[];
+  for(let index=0;index<REST_RING.length;index++) {
+    const next=(index+1)%REST_RING.length,a=REST_RING[index],b=REST_RING[next];
+    const p=body.particles[index+1],q=body.particles[next+1];
+    const px=(p.x-center.x)/scales.x,py=(p.y-center.y)/scales.y;
+    const qx=(q.x-center.x)/scales.x,qy=(q.y-center.y)/scales.y;
+    const det=(a.x*b.y-a.y*b.x)*body.width*body.height;
+    const A=(px*b.y-qx*a.y)*body.height/det,B=(-px*b.x+qx*a.x)*body.width/det;
+    const C=(py*b.y-qy*a.y)*body.height/det,D=(-py*b.x+qy*a.x)*body.width/det;
+    const trace=A*A+B*B+C*C+D*D,d=A*D-B*C;
+    strains.push(Math.sqrt((trace+Math.sqrt(Math.max(0,trace*trace-4*d*d)))*0.5));
+  }
+  strains.sort((a,b)=>b-a);
+  return (strains[0]+strains[1])*0.5;
 }
 
 // Prevent a fan element turning inside out; ordinary dents remain unconstrained.
@@ -893,6 +917,7 @@ class SoftBodyWorld {
     body.sadLanding = null;
     body.landingStabilizer = null;
     body.gestureReleaseReaction = null;
+    body.stretchCryUntil = 0;
     body.gestureReleaseSpeed = 0;
     if (existing.length === 0) body.gestureAxes = drag.axes;
     this.drags.set(pointerId, drag);
@@ -940,11 +965,21 @@ class SoftBodyWorld {
       drag.body.dragPointer = remaining[0].pointerId;
       center.invMass = remaining.length === 1 && remaining[0].centerGrip ? 0 : center.baseInvMass;
       drag.body.gestureReleaseSpeed = 0;
+      // Resistant grips may lag behind the raw finger: keep the material point.
+      const kept = remaining[0], offset = gripOffset(kept);
+      kept.inputOffsetX = kept.targetX - center.x - offset.x;
+      kept.inputOffsetY = kept.targetY - center.y - offset.y;
+      kept.axes = drag.body.twoGripRestAxes ?? normalizedBodyAxes(drag.body);
+      drag.body.gestureAxes = kept.axes;
+      drag.body.twoGripPose = null;
       // The remaining barycentric grip is unchanged: no recenter, throw or face jump.
       return drag.body;
     }
     center.invMass = center.baseInvMass;
     const body = drag.body;
+    body.twoGripPose = null;
+    body.stretchCryUntil = !options.cancel && body.isStretchCrying ? this.time + 0.3 : 0;
+    body.isStretchCrying = false;
     const idleTime = options.time === undefined ? this.time - drag.lastMotionWorldTime
       : options.time - drag.lastMotionInputTime;
     const freshness = Math.exp(-Math.max(0, idleTime) / 0.07);
@@ -969,8 +1004,8 @@ class SoftBodyWorld {
     body.gestureReleaseSpeed = options.cancel ? 0 : Math.min(rawSpeed, GESTURE_TUNING.releaseSpeedLimit);
     if (!options.cancel && drag.maximumDistance >= GESTURE_TUNING.minimumReactionDistance) {
       body.gestureReleaseReaction = {
-        startAt: this.time + GESTURE_TUNING.poutDelay,
-        endAt: this.time + GESTURE_TUNING.poutDelay + GESTURE_TUNING.poutDuration,
+        startAt: this.time + Math.max(GESTURE_TUNING.poutDelay, body.stretchCryUntil - this.time),
+        endAt: this.time + Math.max(GESTURE_TUNING.poutDelay, body.stretchCryUntil - this.time) + GESTURE_TUNING.poutDuration,
         intensity: clamp(0.35 + body.gestureStretch * 0.6, 0.35, 0.95),
       };
     } else {
@@ -1053,6 +1088,7 @@ class SoftBodyWorld {
   expressionFor(bodyOrId) {
     const body = this.getBody(bodyOrId);
     if (!body) return "neutral";
+    if (body.isStretchCrying || this.time < body.stretchCryUntil) return "cry";
     if (body.isScared) return "eek";
     if (body.sadLanding
       && this.time >= body.sadLanding.startAt
@@ -1163,10 +1199,10 @@ class SoftBodyWorld {
       this.updateTransientStates(body, safeDt);
       this.integrateBody(body, safeDt);
     }
-    this.applyDragLag();
-    this.updateDragGestures(safeDt);
     this.updateTwoGripElasticity(safeDt);
     this.updateFloorCompression(safeDt);
+    this.applyDragLag();
+    this.updateDragGestures(safeDt);
 
     for (let iteration = 0; iteration < this.config.iterations; iteration += 1) {
       this.applyDragTargets();
@@ -1185,7 +1221,10 @@ class SoftBodyWorld {
 
     this.applyDragPose();
     this.applyDragTargets(true);
-    for (const body of this.bodies) this.solveBounds(body, safeDt);
+    for (const body of this.bodies) {
+      for (let guard = 0; guard < 3; guard += 1) solveMeshOrientation(body);
+      this.solveBounds(body, safeDt);
+    }
     this.finishContacts();
     for (const body of this.bodies) this.updateGestureFace(body, safeDt);
     this.recoverInvalidBodies();
@@ -1246,17 +1285,7 @@ class SoftBodyWorld {
   }
 
   applyTwoGripTargets(body, drags, finalPass) {
-    const targets = drags.map(drag => this.effectiveDragTarget(drag));
-    const dx = targets[1].x - targets[0].x, dy = targets[1].y - targets[0].y;
-    const span = Math.hypot(dx, dy);
-    const initialSpan = Math.hypot(drags[1].startX - drags[0].startX, drags[1].startY - drags[0].startY);
-    const maximumSpan = Math.min(this.width - this.config.wallPadding * 2, Math.max(initialSpan, body.width * 0.8) * 2.2);
-    if (span > maximumSpan) {
-      const mx = (targets[0].x + targets[1].x) * 0.5, my = (targets[0].y + targets[1].y) * 0.5;
-      const scale = maximumSpan / span * 0.5;
-      targets[0] = { x: mx - dx * scale, y: my - dy * scale };
-      targets[1] = { x: mx + dx * scale, y: my + dy * scale };
-    }
+    const targets = this.twoGripTargets(body, drags);
     const weights = drags.map(drag => {
       const values = body.particles.map(() => 0);
       for (const entry of drag.grip) values[entry.index] = entry.weight;
@@ -1300,8 +1329,8 @@ class SoftBodyWorld {
     const right = this.width-this.config.wallPadding-drag.rightGripClearance*scaleX;
     const top = Math.max(8,2+drag.ceilingGripClearance*scaleY);
     const bottom = this.floorY-Math.max(6,drag.floorGripClearance*scaleY);
-    return {x:clamp(drag.targetX,Math.min(left,right),Math.max(left,right)),
-      y:clamp(drag.targetY,Math.min(top,bottom),Math.max(top,bottom))};
+    return {x:clamp(drag.targetX-(drag.inputOffsetX??0),Math.min(left,right),Math.max(left,right)),
+      y:clamp(drag.targetY-(drag.inputOffsetY??0),Math.min(top,bottom),Math.max(top,bottom))};
   }
 
   applyDragPose() {
@@ -1412,23 +1441,85 @@ class SoftBodyWorld {
       const drags = this.bodyDrags(body);
       let target = 1;
       if (drags.length === 2) {
-        const dx = drags[1].startX-drags[0].startX, dy = drags[1].startY-drags[0].startY;
-        const initial = Math.max(8, Math.hypot(dx,dy));
-        const span = Math.hypot(drags[1].targetX-drags[0].targetX,drags[1].targetY-drags[0].targetY);
-        const maximum = Math.min(2.2, (this.width-this.config.wallPadding*2)/(body.width*1.08*floorScales(body).x));
-        target = clamp(span/initial,1,Math.max(1,maximum));
-        body.twoGripAxis = {x:dx/initial,y:dy/initial};
-        body.twoGripRestAxes = drags[0].axes;
+        const dx = drags[1].targetX-drags[0].targetX, dy = drags[1].targetY-drags[0].targetY;
+        const span = Math.hypot(dx,dy), key = drags.map(d=>d.pointerId).join(":");
+        if (!body.twoGripPose || body.twoGripPose.key !== key) {
+          const a = gripOffset(drags[0]), b = gripOffset(drags[1]);
+          const angle = Math.atan2(b.y-a.y,b.x-a.x);
+          body.twoGripPose = {key,initialSpan:Math.max(8,Math.hypot(b.x-a.x,b.y-a.y)),angle,
+            inputAngle:Math.atan2(dy,dx),materialAngle:angle};
+          body.twoGripRestAxes = normalizedBodyAxes(body);
+          body.twoGripStretch = 1;
+        }
+        const pose = body.twoGripPose;
+        // Progressive resistance: derivative 1 near rest, tending to zero at
+        // 1.8x. Closing/crossing fingers cannot annihilate a material diameter.
+        const ratio = span/pose.initialSpan;
+        target = ratio >= 1 ? 1+0.8*(1-Math.exp(-(ratio-1)/0.8))
+          : 1-0.18*(1-Math.exp(-(1-ratio)/0.18));
+        const desired = Math.atan2(dy,dx)-pose.inputAngle+pose.materialAngle;
+        const delta = Math.atan2(Math.sin(desired-pose.angle),Math.cos(desired-pose.angle));
+        const rotation = span > pose.initialSpan*0.16 ? clamp(delta,-8*dt,8*dt) : 0;
+        pose.angle += rotation;
+        const c=Math.cos(rotation),s=Math.sin(rotation),center=body.particles[0];
+        // Transport the whole material frame (including velocity) together.
+        // This is external finger torque, not a replacement/reset of the mesh.
+        const oldX=center.x,oldY=center.y,oldPX=center.px,oldPY=center.py;
+        for(const point of body.particles.slice(1)) {
+          const x=point.x-oldX,y=point.y-oldY,px=point.px-oldPX,py=point.py-oldPY;
+          point.x=oldX+c*x-s*y;point.y=oldY+s*x+c*y;
+          point.px=oldPX+c*px-s*py;point.py=oldPY+s*px+c*py;
+        }
+        const axes=body.twoGripRestAxes;
+        body.twoGripRestAxes={ux:c*axes.ux-s*axes.uy,uy:s*axes.ux+c*axes.uy,
+          vx:c*axes.vx-s*axes.vy,vy:s*axes.vx+c*axes.vy};
+        body.twoGripAxis={x:Math.cos(pose.angle),y:Math.sin(pose.angle)};
+        body.gestureAxes=body.twoGripRestAxes;
       }
       body.twoGripStretch += (target-body.twoGripStretch)*(1-Math.exp(-dt/(drags.length===2?0.07:0.22)));
-      if (body.twoGripStretch < 1.0001) body.twoGripStretch = 1;
+      if (Math.abs(body.twoGripStretch-1) < 0.0001) {
+        body.twoGripStretch = 1;
+        if(drags.length!==2) {
+          body.twoGripRestAxes=null;
+          body.twoGripAxis=null;
+        }
+      }
+      if(drags.length===2) {
+        const targets=this.twoGripTargets(body,drags);
+        const offsets=drags.map(d=>gripOffset(d));
+        const dx=(targets[0].x+targets[1].x)*0.5-body.particles[0].x-(offsets[0].x+offsets[1].x)*0.5;
+        const dy=(targets[0].y+targets[1].y)*0.5-body.particles[0].y-(offsets[0].y+offsets[1].y)*0.5;
+        const scale=Math.min(1,18/Math.max(EPSILON,Math.hypot(dx,dy)));
+        for(const point of body.particles)translateParticle(point,dx*scale,dy*scale,true);
+      }
     }
+  }
+
+  posedOffsets(body) {
+    const axes=body.twoGripRestAxes ?? body.floorAxes ?? normalizedBodyAxes(body),scales=floorScales(body);
+    return [{x:0,y:0},...REST_RING.map(rest=>{
+      const v=twoGripVector(body,axes.ux*rest.x*body.width+axes.vx*rest.y*body.height,
+        axes.uy*rest.x*body.width+axes.vy*rest.y*body.height);
+      return {x:v.x*scales.x,y:v.y*scales.y};
+    })];
+  }
+
+  twoGripTargets(body,drags) {
+    const offsets=this.posedOffsets(body);
+    const grips=drags.map(d=>d.grip.reduce((v,e)=>({x:v.x+offsets[e.index].x*e.weight,
+      y:v.y+offsets[e.index].y*e.weight}),{x:0,y:0}));
+    const mx=(drags[0].targetX+drags[1].targetX)*0.5-(grips[0].x+grips[1].x)*0.5;
+    const my=(drags[0].targetY+drags[1].targetY)*0.5-(grips[0].y+grips[1].y)*0.5;
+    const x=clamp(mx,this.config.wallPadding-Math.min(...offsets.map(p=>p.x)),
+      this.width-this.config.wallPadding-Math.max(...offsets.map(p=>p.x)));
+    const y=clamp(my,2-Math.min(...offsets.map(p=>p.y)),this.floorY-Math.max(...offsets.map(p=>p.y)));
+    return grips.map(g=>({x:x+g.x,y:y+g.y}));
   }
 
   solveFloorCompression(body) {
     if (body.floorCompression < 0.002 || body.dragPointer === null || !body.floorAxes) return;
     if (!this.bodyDrags(body).some(drag => drag.targetY > this.floorY-drag.floorGripClearance)) return;
-    const axes = body.floorAxes;
+    const axes = body.twoGripRestAxes ?? body.floorAxes;
     const scales = floorScales(body);
     const center = body.particles[0];
     const offsets = REST_RING.map(rest => twoGripVector(body,
@@ -1449,9 +1540,10 @@ class SoftBodyWorld {
 
   solveGestureStretch(body) {
     const amount = body.gestureStretch;
-    if (amount < 0.002) return;
+    const pair = this.bodyDrags(body).length === 2;
+    if (amount < 0.002 && !pair && Math.abs(body.twoGripStretch-1)<0.002) return;
     const drag = body.dragPointer !== null ? this.drags.get(body.dragPointer) : null;
-    const axes = drag?.axes ?? body.gestureAxes ?? normalizedBodyAxes(body);
+    const axes = body.twoGripRestAxes ?? drag?.axes ?? body.gestureAxes ?? normalizedBodyAxes(body);
     const center = body.particles[0];
     const directionX = body.gestureDirectionX;
     const directionY = body.gestureDirectionY;
@@ -1469,10 +1561,11 @@ class SoftBodyWorld {
       const parallel = localX * directionX + localY * directionY;
       const perpendicularX = localX - directionX * parallel;
       const perpendicularY = localY - directionY * parallel;
-      const parallelGain = 1 + amount * GESTURE_TUNING.stretchParallelGain;
+      const dualRecovery = pair || Math.abs(body.twoGripStretch-1)>0.002;
+      const parallelGain = 1 + (dualRecovery ? 0 : amount) * GESTURE_TUNING.stretchParallelGain;
       const perpendicularScale = 1 / parallelGain;
       const trailingWeight = clamp(0.5 - parallel / body.height, 0, 1);
-      const trail = amount * body.height * GESTURE_TUNING.stretchTrailGain * trailingWeight;
+      const trail = (dualRecovery ? 0 : amount) * body.height * GESTURE_TUNING.stretchTrailGain * trailingWeight;
       const targetX = center.x + directionX * (parallel * parallelGain - trail)
         + perpendicularX * perpendicularScale;
       const targetY = center.y + directionY * (parallel * parallelGain - trail)
@@ -1497,6 +1590,11 @@ class SoftBodyWorld {
   }
 
   updateGestureFace(body, dt) {
+    body.actualStretch += (materialStretch(body)-body.actualStretch)*(1-Math.exp(-dt/0.035));
+    const held=body.dragPointer!==null;
+    if(!held) body.isStretchCrying=false;
+    else if(!body.isStretchCrying && body.actualStretch>1.18) body.isStretchCrying=true;
+    else if(body.isStretchCrying && body.actualStretch<1.10) body.isStretchCrying=false;
     const targetSurprise = clamp(body.gestureStretch * 1.1, 0, 1);
     const surpriseResponse = 1 - Math.exp(-dt / (targetSurprise > body.gestureSurprise ? 0.055 : 0.11));
     body.gestureSurprise += (targetSurprise - body.gestureSurprise) * surpriseResponse;
@@ -1955,6 +2053,8 @@ class SoftBodyWorld {
         gestureStretch: body.gestureStretch,
         gestureSurprise: body.gestureSurprise,
         gesturePout: body.gesturePout,
+        actualStretch: body.actualStretch,
+        isStretchCrying: body.isStretchCrying,
         releaseSpeed: body.gestureReleaseSpeed,
         expression: this.expressionFor(body),
         particles: body.particles.map((point) => ({ x: point.x, y: point.y, px: point.px, py: point.py })),
@@ -2041,10 +2141,12 @@ const FACE_EXPRESSIONS = Object.freeze({
   hmph: { open: 0, close: 0.85, sad: 0, pout: 0.8 },
   sly: { open: 0, close: 0.9, sad: 0, pout: 0 },
   sad: { open: 0, close: 0, sad: 1, pout: 0 },
+  cry: { open: 0, close: 0, sad: 1, pout: 0 },
 });
 
 function facePoseFor(expression, surprise = 0, pout = 0) {
   const base = FACE_EXPRESSIONS[expression] ?? FACE_EXPRESSIONS.neutral;
+  if (expression === "cry") return { ...base };
   const gestureOpen = Math.max(0, Math.min(1, surprise));
   const gesturePout = Math.max(0, Math.min(1, pout));
   return {
