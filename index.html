@@ -2,7 +2,7 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#fff3dd">
     <meta name="color-scheme" content="light">
     <title>ぷるぷるぷりん</title>
@@ -630,6 +630,11 @@ function createBody(id, x, y, width, height, variant, createdAt) {
     gestureAxes: null,
     gestureReleaseSpeed: 0,
     gestureReleaseReaction: null,
+    floorCompression: 0,
+    floorAxes: null,
+    twoGripStretch: 1,
+    twoGripAxis: null,
+    twoGripRestAxes: null,
   };
 }
 
@@ -644,7 +649,20 @@ function solveDistanceConstraint(body, constraint) {
   const weight = a.invMass + b.invMass;
   if (weight < EPSILON) return;
 
-  const correction = ((length - constraint.rest) / length) * constraint.stiffness;
+  let restLength = constraint.rest;
+  if ((body.floorCompression > 0.002 && body.floorAxes) || body.twoGripStretch > 1.002) {
+    const localA = constraint.a === 0 ? { x: 0, y: 0 } : REST_RING[constraint.a - 1];
+    const localB = constraint.b === 0 ? { x: 0, y: 0 } : REST_RING[constraint.b - 1];
+    const axes = body.twoGripRestAxes ?? body.floorAxes;
+    const rx = (localB.x - localA.x) * body.width;
+    const ry = (localB.y - localA.y) * body.height;
+    const wx = axes.ux * rx + axes.vx * ry;
+    const wy = axes.uy * rx + axes.vy * ry;
+    const deformed = twoGripVector(body, wx, wy);
+    const scales = floorScales(body);
+    restLength *= Math.hypot(deformed.x * scales.x, deformed.y * scales.y) / Math.max(EPSILON, Math.hypot(wx, wy));
+  }
+  const correction = ((length - restLength) / length) * constraint.stiffness;
   const moveAX = dx * correction * (a.invMass / weight);
   const moveAY = dy * correction * (a.invMass / weight);
   const moveBX = dx * correction * (b.invMass / weight);
@@ -695,6 +713,42 @@ function translateParticle(point, dx, dy, preserveVelocity = true, preserveRende
   if (preserveRenderState) {
     point.renderX += dx;
     point.renderY += dy;
+  }
+}
+
+function floorScales(body) {
+  return { x: 1 + body.floorCompression * 0.55, y: 1 - body.floorCompression * 0.45 };
+}
+
+function twoGripVector(body, x, y) {
+  if (!body.twoGripAxis || body.twoGripStretch <= 1.002) return { x, y };
+  const axis = body.twoGripAxis, parallel = x * axis.x + y * axis.y;
+  const perpendicularX = x - axis.x * parallel, perpendicularY = y - axis.y * parallel;
+  return { x:axis.x * parallel * body.twoGripStretch + perpendicularX / body.twoGripStretch,
+    y:axis.y * parallel * body.twoGripStretch + perpendicularY / body.twoGripStretch };
+}
+
+// Prevent a fan element turning inside out; ordinary dents remain unconstrained.
+function solveMeshOrientation(body) {
+  const center = body.particles[0];
+  for (let index = 1; index < body.particles.length; index += 1) {
+    const next = index === body.particles.length - 1 ? 1 : index + 1;
+    const a = body.particles[index], b = body.particles[next];
+    const ra = REST_RING[index - 1], rb = REST_RING[next - 1];
+    const minimum = (ra.x * rb.y - ra.y * rb.x) * body.width * body.height * 0.035;
+    const area = (a.x - center.x) * (b.y - center.y) - (a.y - center.y) * (b.x - center.x);
+    if (area >= minimum) continue;
+    const gradients = [
+      { point: center, x: a.y - b.y, y: b.x - a.x },
+      { point: a, x: b.y - center.y, y: center.x - b.x },
+      { point: b, x: center.y - a.y, y: a.x - center.x },
+    ];
+    const denominator = gradients.reduce((sum, g) => sum + g.point.invMass * (g.x * g.x + g.y * g.y), 0);
+    const lambda = (minimum - area) * 0.7 / Math.max(EPSILON, denominator);
+    for (const g of gradients) {
+      g.point.x += g.x * lambda * g.point.invMass;
+      g.point.y += g.y * lambda * g.point.invMass;
+    }
   }
 }
 
@@ -798,9 +852,11 @@ class SoftBodyWorld {
 
   beginDrag(pointerId, x, y, options = {}) {
     if (this.paused || this.stopped || this.drags.has(pointerId)) return null;
-    const occupied = new Set([...this.drags.values()].map((drag) => drag.body.id));
+    const occupied = new Set(this.bodies.filter(body => this.bodyDrags(body).length >= 2).map(body => body.id));
     const body = this.hitTest(x, y, occupied);
-    if (!body || body.dragPointer !== null) return null;
+    if (!body) return null;
+    const existing = this.bodyDrags(body);
+    if (existing.some(drag => Math.hypot(drag.targetX - x, drag.targetY - y) < 8)) return null;
 
     const center = body.particles[0];
     const drag = {
@@ -822,21 +878,29 @@ class SoftBodyWorld {
       velocityY: 0,
       maximumDistance: 0,
       axes: normalizedBodyAxes(body),
+      floorGripClearance: Math.max(2, bodyAabb(body).maxY - y),
+      ceilingGripClearance: Math.max(2, y - bodyAabb(body).minY),
+      leftGripClearance: Math.max(2, x - bodyAabb(body).minX),
+      rightGripClearance: Math.max(2, bodyAabb(body).maxX - x),
     };
     center.baseInvMass = center.baseInvMass || 0.72;
     drag.centerGrip = drag.grip[0].weight > 0.999;
-    center.invMass = drag.centerGrip ? 0 : center.baseInvMass;
+    center.invMass = drag.centerGrip && existing.length === 0 ? 0 : center.baseInvMass;
     center.px = center.x;
     center.py = center.y;
-    body.dragPointer = pointerId;
+    if (existing.length === 0) body.dragPointer = pointerId;
     body.isScared = false;
     body.sadLanding = null;
     body.landingStabilizer = null;
     body.gestureReleaseReaction = null;
     body.gestureReleaseSpeed = 0;
-    body.gestureAxes = drag.axes;
+    if (existing.length === 0) body.gestureAxes = drag.axes;
     this.drags.set(pointerId, drag);
     return body;
+  }
+
+  bodyDrags(body) {
+    return [...this.drags.values()].filter(drag => drag.body === body);
   }
 
   moveDrag(pointerId, x, y, options = {}) {
@@ -870,6 +934,15 @@ class SoftBodyWorld {
     const drag = this.drags.get(pointerId);
     if (!drag) return null;
     const center = drag.body.particles[0];
+    this.drags.delete(pointerId);
+    const remaining = this.bodyDrags(drag.body);
+    if (remaining.length > 0) {
+      drag.body.dragPointer = remaining[0].pointerId;
+      center.invMass = remaining.length === 1 && remaining[0].centerGrip ? 0 : center.baseInvMass;
+      drag.body.gestureReleaseSpeed = 0;
+      // The remaining barycentric grip is unchanged: no recenter, throw or face jump.
+      return drag.body;
+    }
     center.invMass = center.baseInvMass;
     const body = drag.body;
     const idleTime = options.time === undefined ? this.time - drag.lastMotionWorldTime
@@ -1092,6 +1165,8 @@ class SoftBodyWorld {
     }
     this.applyDragLag();
     this.updateDragGestures(safeDt);
+    this.updateTwoGripElasticity(safeDt);
+    this.updateFloorCompression(safeDt);
 
     for (let iteration = 0; iteration < this.config.iterations; iteration += 1) {
       this.applyDragTargets();
@@ -1101,6 +1176,8 @@ class SoftBodyWorld {
         this.solveGestureStretch(body);
         this.solvePokeDeformation(body);
         this.solveTransientShape(body);
+        this.solveFloorCompression(body);
+        solveMeshOrientation(body);
       }
       this.solveBodyCollisions();
       for (const body of this.bodies) this.solveBounds(body, safeDt);
@@ -1127,14 +1204,22 @@ class SoftBodyWorld {
   }
 
   applyDragTargets(finalPass = false) {
-    for (const drag of this.drags.values()) {
+    for (const body of this.bodies) {
+      const drags = this.bodyDrags(body);
+      if (drags.length === 2) {
+        this.applyTwoGripTargets(body, drags, finalPass);
+        continue;
+      }
+      const drag = drags[0];
+      if (!drag) continue;
       const center = drag.body.particles[0];
       const offset = gripOffset(drag);
-      const targetX = clamp(drag.targetX, drag.body.width * 0.15, this.width - drag.body.width * 0.15);
-      const targetY = clamp(drag.targetY, 8, this.floorY - 6);
+      const target = this.effectiveDragTarget(drag);
+      const targetX = target.x, targetY = target.y;
       if (drag.centerGrip) {
         center.x = clamp(targetX, drag.body.width * 0.45, this.width - drag.body.width * 0.45);
-        center.y = clamp(targetY, drag.body.height * 0.45, this.floorY - drag.body.height * 0.26);
+        center.y = clamp(targetY, drag.body.height * 0.45,
+          this.floorY - drag.body.height * 0.51 * floorScales(drag.body).y);
         if (finalPass) {
           center.px = center.x;
           center.py = center.y;
@@ -1160,8 +1245,68 @@ class SoftBodyWorld {
     }
   }
 
+  applyTwoGripTargets(body, drags, finalPass) {
+    const targets = drags.map(drag => this.effectiveDragTarget(drag));
+    const dx = targets[1].x - targets[0].x, dy = targets[1].y - targets[0].y;
+    const span = Math.hypot(dx, dy);
+    const initialSpan = Math.hypot(drags[1].startX - drags[0].startX, drags[1].startY - drags[0].startY);
+    const maximumSpan = Math.min(this.width - this.config.wallPadding * 2, Math.max(initialSpan, body.width * 0.8) * 2.2);
+    if (span > maximumSpan) {
+      const mx = (targets[0].x + targets[1].x) * 0.5, my = (targets[0].y + targets[1].y) * 0.5;
+      const scale = maximumSpan / span * 0.5;
+      targets[0] = { x: mx - dx * scale, y: my - dy * scale };
+      targets[1] = { x: mx + dx * scale, y: my + dy * scale };
+    }
+    const weights = drags.map(drag => {
+      const values = body.particles.map(() => 0);
+      for (const entry of drag.grip) values[entry.index] = entry.weight;
+      return values;
+    });
+    const residual = targets.map((target, index) => ({
+      x: target.x - body.particles.reduce((sum,p,i) => sum + p.x * weights[index][i], 0),
+      y: target.y - body.particles.reduce((sum,p,i) => sum + p.y * weights[index][i], 0),
+    }));
+    let a = 0, b = 0, cross = 0;
+    for (let index = 0; index < body.particles.length; index += 1) {
+      const mass = body.particles[index].baseInvMass;
+      a += weights[0][index] ** 2 * mass;
+      b += weights[1][index] ** 2 * mass;
+      cross += weights[0][index] * weights[1][index] * mass;
+    }
+    const determinant = Math.max(EPSILON, a * b - cross * cross);
+    const lambda = residual.map((r,index) => {
+      const other = residual[1-index], diagonal = index === 0 ? b : a;
+      return { x:(diagonal*r.x-cross*other.x)/determinant, y:(diagonal*r.y-cross*other.y)/determinant };
+    });
+    for (let index = 0; index < body.particles.length; index += 1) {
+      const point = body.particles[index];
+      const mx = (weights[0][index]*lambda[0].x+weights[1][index]*lambda[1].x)*point.baseInvMass;
+      const my = (weights[0][index]*lambda[0].y+weights[1][index]*lambda[1].y)*point.baseInvMass;
+      point.x += clamp(mx, -30, 30);
+      point.y += clamp(my, -30, 30);
+      if (finalPass && (weights[0][index] !== 0 || weights[1][index] !== 0)) {
+        point.px = point.x;
+        point.py = point.y;
+      }
+    }
+  }
+
+  effectiveDragTarget(drag) {
+    const body = drag.body, scales = floorScales(body);
+    const axis = body.twoGripAxis ?? {x:1,y:0}, stretch = body.twoGripStretch;
+    const scaleX = scales.x * Math.hypot(axis.x*stretch,axis.y/stretch);
+    const scaleY = scales.y * Math.hypot(axis.y*stretch,axis.x/stretch);
+    const left = this.config.wallPadding + drag.leftGripClearance*scaleX;
+    const right = this.width-this.config.wallPadding-drag.rightGripClearance*scaleX;
+    const top = Math.max(8,2+drag.ceilingGripClearance*scaleY);
+    const bottom = this.floorY-Math.max(6,drag.floorGripClearance*scaleY);
+    return {x:clamp(drag.targetX,Math.min(left,right),Math.max(left,right)),
+      y:clamp(drag.targetY,Math.min(top,bottom),Math.max(top,bottom))};
+  }
+
   applyDragPose() {
     for (const drag of this.drags.values()) {
+      if (this.bodyDrags(drag.body).length > 1) continue;
       const movementLength = Math.hypot(drag.lastMoveX, drag.lastMoveY);
       if (movementLength >= 0.2) {
         const directionX = drag.lastMoveX / movementLength;
@@ -1185,15 +1330,17 @@ class SoftBodyWorld {
 
   applyDragLag() {
     for (const drag of this.drags.values()) {
+      if (this.bodyDrags(drag.body).length > 1) continue;
       const center = drag.body.particles[0];
       const offset = gripOffset(drag);
+      const target = this.effectiveDragTarget(drag);
       const targetX = clamp(
-        drag.targetX - offset.x,
+        target.x - offset.x,
         drag.body.width * 0.45,
         this.width - drag.body.width * 0.45,
       );
       const targetY = clamp(
-        drag.targetY - offset.y,
+        target.y - offset.y,
         drag.body.height * 0.45,
         this.floorY - drag.body.height * 0.26,
       );
@@ -1223,21 +1370,80 @@ class SoftBodyWorld {
   }
 
   updateDragGestures(dt) {
-    for (const drag of this.drags.values()) {
-      const body = drag.body;
-      const deltaX = drag.targetX - drag.startX;
-      const deltaY = drag.targetY - drag.startY;
+    for (const body of this.bodies) {
+      const drags = this.bodyDrags(body);
+      if (drags.length === 0) continue;
+      const drag = drags[0], second = drags[1];
+      const deltaX = second ? second.targetX - drag.targetX : drag.targetX - drag.startX;
+      const deltaY = second ? second.targetY - drag.targetY : drag.targetY - drag.startY;
       const distanceMoved = Math.hypot(deltaX, deltaY);
       if (distanceMoved > 2) {
         body.gestureDirectionX = deltaX / distanceMoved;
         body.gestureDirectionY = deltaY / distanceMoved;
       }
-      const idleTime = Math.max(0, this.time - drag.lastMotionWorldTime - 0.025);
+      const lastMotion = Math.max(...drags.map(entry => entry.lastMotionWorldTime));
+      const idleTime = Math.max(0, this.time - lastMotion - 0.025);
       const activity = Math.exp(-idleTime / 0.11);
-      const target = smoothstep01(distanceMoved / (body.height * GESTURE_TUNING.stretchDistanceFactor))
+      const initialSpan = second ? Math.hypot(second.startX-drag.startX,second.startY-drag.startY) : 0;
+      const reactionDistance = second ? Math.max(0,distanceMoved-initialSpan) : distanceMoved;
+      const target = smoothstep01(reactionDistance / (body.height * GESTURE_TUNING.stretchDistanceFactor))
         * activity;
       const response = 1 - Math.exp(-dt / (target > body.gestureStretch ? 0.085 : 0.15));
       body.gestureStretch += (target - body.gestureStretch) * response;
+    }
+  }
+
+  updateFloorCompression(dt) {
+    for (const body of this.bodies) {
+      let target = 0;
+      for (const drag of this.drags.values()) {
+        if (drag.body !== body) continue;
+        const pressure = drag.targetY - (this.floorY - drag.floorGripClearance);
+        target = Math.max(target, smoothstep01(pressure / (body.height * 0.65)));
+        if (pressure > 0) body.floorAxes = drag.axes;
+      }
+      body.floorCompression += (target - body.floorCompression) * (1 - Math.exp(-dt / (target > body.floorCompression ? 0.075 : 0.14)));
+      if (body.floorCompression < 0.0001) body.floorCompression = 0;
+    }
+  }
+
+  updateTwoGripElasticity(dt) {
+    for (const body of this.bodies) {
+      const drags = this.bodyDrags(body);
+      let target = 1;
+      if (drags.length === 2) {
+        const dx = drags[1].startX-drags[0].startX, dy = drags[1].startY-drags[0].startY;
+        const initial = Math.max(8, Math.hypot(dx,dy));
+        const span = Math.hypot(drags[1].targetX-drags[0].targetX,drags[1].targetY-drags[0].targetY);
+        const maximum = Math.min(2.2, (this.width-this.config.wallPadding*2)/(body.width*1.08*floorScales(body).x));
+        target = clamp(span/initial,1,Math.max(1,maximum));
+        body.twoGripAxis = {x:dx/initial,y:dy/initial};
+        body.twoGripRestAxes = drags[0].axes;
+      }
+      body.twoGripStretch += (target-body.twoGripStretch)*(1-Math.exp(-dt/(drags.length===2?0.07:0.22)));
+      if (body.twoGripStretch < 1.0001) body.twoGripStretch = 1;
+    }
+  }
+
+  solveFloorCompression(body) {
+    if (body.floorCompression < 0.002 || body.dragPointer === null || !body.floorAxes) return;
+    if (!this.bodyDrags(body).some(drag => drag.targetY > this.floorY-drag.floorGripClearance)) return;
+    const axes = body.floorAxes;
+    const scales = floorScales(body);
+    const center = body.particles[0];
+    const offsets = REST_RING.map(rest => twoGripVector(body,
+      axes.ux * rest.x * body.width + axes.vx * rest.y * body.height,
+      axes.uy * rest.x * body.width + axes.vy * rest.y * body.height));
+    const bottom = Math.max(...offsets.map(offset => offset.y));
+    const centerY = this.floorY - bottom * scales.y;
+    if (center.invMass > 0) {
+      translateParticle(center, 0, (centerY - center.y) * 0.24, true);
+    }
+    for (let index = 0; index < REST_RING.length; index += 1) {
+      const targetX = center.x + offsets[index].x * scales.x;
+      const targetY = centerY + offsets[index].y * scales.y;
+      const point = body.particles[index + 1];
+      translateParticle(point, (targetX - point.x) * 0.2, (targetY - point.y) * 0.2, true);
     }
   }
 
@@ -1254,8 +1460,12 @@ class SoftBodyWorld {
     let correctionY = 0;
     for (let index = 0; index < REST_RING.length; index += 1) {
       const rest = REST_RING[index];
-      const localX = axes.ux * rest.x * body.width + axes.vx * rest.y * body.height;
-      const localY = axes.uy * rest.x * body.width + axes.vy * rest.y * body.height;
+      const strain = twoGripVector(body,
+        axes.ux * rest.x * body.width + axes.vx * rest.y * body.height,
+        axes.uy * rest.x * body.width + axes.vy * rest.y * body.height);
+      const scales = floorScales(body);
+      const localX = strain.x * scales.x;
+      const localY = strain.y * scales.y;
       const parallel = localX * directionX + localY * directionY;
       const perpendicularX = localX - directionX * parallel;
       const perpendicularY = localY - directionY * parallel;
@@ -1496,7 +1706,7 @@ class SoftBodyWorld {
     const floor = this.floorY;
     const left = this.config.wallPadding;
     const right = this.width - this.config.wallPadding;
-    for (let index = 1; index < body.particles.length; index += 1) {
+    for (let index = 0; index < body.particles.length; index += 1) {
       const point = body.particles[index];
       if (point.y > floor) {
         const vx = point.x - point.px;
@@ -1871,13 +2081,13 @@ class FaceRig {
     return record.value;
   }
 
-  drawPart(context, body, rect, x, y, width, height, opacity, mapLocalPoint) {
+  drawPart(context, body, rect, x, y, width, height, opacity, mapLocalPoint, rotation = 0) {
     if (!rect || opacity < 0.003) return;
     const [sx, sy, sw, sh] = rect.rect ?? rect;
     const [anchorX, anchorY] = rect.anchor ?? [0.5, 0.5];
     const center = mapLocalPoint(body, x, y);
-    const right = mapLocalPoint(body, x + width * 0.5, y);
-    const bottom = mapLocalPoint(body, x, y + height * 0.5);
+    const right = mapLocalPoint(body, x + width * 0.5 * Math.cos(rotation), y + width * 0.5 * Math.sin(rotation));
+    const bottom = mapLocalPoint(body, x - height * 0.5 * Math.sin(rotation), y + height * 0.5 * Math.cos(rotation));
     context.save();
     context.globalAlpha *= opacity;
     context.transform(
@@ -1891,41 +2101,45 @@ class FaceRig {
 
   draw(context, body, pose, mapLocalPoint) {
     if (!this.atlas || !this.parts) return false;
-    // A light pout must remain readable on a ~120px body, without a hard switch.
+    // One opaque image per feature: openness/size/angle animate geometrically.
+    // Closed eyes replace a vertically squashed open eye at the blink midpoint.
+    // Never cross-fade unrelated contours or stack two mouths on one another.
     const visiblePout = 1 - Math.pow(1 - pose.pout, 2.4);
     const open = pose.open * (1 - visiblePout * 0.75);
     const closed = Math.max(pose.close, visiblePout * 0.8) * (1 - open);
     const tears = pose.sad * (1 - open) * (1 - pose.close);
-    const neutral = Math.max(0, 1 - open - closed - tears);
     for (const [side, x] of [["left", -0.115], ["right", 0.115]]) {
       const eye = this.parts.eyes;
-      this.drawPart(context, body, eye.normal[side], x, 0.055,
-        0.087 + open * 0.005, 0.12, neutral, mapLocalPoint);
-      this.drawPart(context, body, eye.wide[side], x, 0.052,
-        0.087 + open * 0.02, 0.115 + open * 0.025, open, mapLocalPoint);
-      this.drawPart(context, body, eye.closed[side], x, 0.055,
-        0.105, 0.075, closed, mapLocalPoint);
-      this.drawPart(context, body, eye.tears[side], x, 0.062,
-        0.095, 0.145, tears, mapLocalPoint);
-      const brow = this.parts.brows;
-      this.drawPart(context, body, brow.normal[side], x, -0.045,
-        0.095, 0.038, open * 0.18, mapLocalPoint);
-      this.drawPart(context, body, brow.worried[side], x, -0.04,
-        0.1, 0.05, pose.sad * 0.65, mapLocalPoint);
-      this.drawPart(context, body, brow.angry[side], x, -0.04,
-        0.1, 0.045, visiblePout * 0.55, mapLocalPoint);
+      const eyeRect = closed > 0.57 ? eye.closed[side]
+        : tears > 0.55 ? eye.tears[side] : eye.normal[side];
+      const eyeHeight = closed > 0.57 ? 0.025 + (closed - 0.57) * 0.045
+        : Math.max(0.018, (0.12 + open * 0.035 + tears * 0.016) * (1 - closed * 1.6));
+      this.drawPart(context, body, eyeRect, x, 0.055,
+        0.087 + open * 0.018 + closed * 0.012, eyeHeight, 1, mapLocalPoint);
+      const browAmount = Math.max(open * 0.8, pose.sad, visiblePout);
+      if (browAmount > 0.03) {
+        const sideSign = side === "left" ? 1 : -1;
+        this.drawPart(context, body, this.parts.brows.normal[side], x, -0.04 - open * 0.017,
+          0.095, 0.035 * Math.min(1, browAmount * 2.5), 1, mapLocalPoint,
+          sideSign * (visiblePout * 0.24 - pose.sad * 0.23));
+      }
     }
     const mouth = this.parts.mouths;
     const mouthPout = visiblePout * (1 - open);
     const mouthSad = pose.sad * (1 - open) * (1 - pose.pout);
-    this.drawPart(context, body, mouth.smile, 0, 0.155, 0.105, 0.068,
-      Math.max(0, 1 - open - mouthPout - mouthSad), mapLocalPoint);
-    this.drawPart(context, body, mouth.open, 0, 0.155, 0.045 + open * 0.035,
-      0.06 + open * 0.11, open, mapLocalPoint);
-    this.drawPart(context, body, mouth.pout, 0, 0.16, 0.095, 0.045,
-      mouthPout, mapLocalPoint);
-    this.drawPart(context, body, mouth.worry, 0, 0.16, 0.13, 0.045,
-      mouthSad, mapLocalPoint);
+    if (open > 0.22) {
+      this.drawPart(context, body, mouth.open, 0, 0.155,
+        0.035 + open * 0.045, 0.018 + Math.max(0,open-0.22)/0.78*0.15, 1, mapLocalPoint);
+    } else if (mouthPout > 0.32) {
+      this.drawPart(context, body, mouth.pout, 0, 0.16,
+        0.085 + mouthPout*0.01, 0.018 + mouthPout*0.027, 1, mapLocalPoint);
+    } else if (mouthSad > 0.4) {
+      this.drawPart(context, body, mouth.worry, 0, 0.16,
+        0.11 + mouthSad*0.02, 0.02 + mouthSad*0.025, 1, mapLocalPoint);
+    } else {
+      this.drawPart(context, body, mouth.smile, 0, 0.155,
+        0.105 - open*0.06, Math.max(0.018,0.068*(1-open/0.3-mouthPout*1.3)), 1, mapLocalPoint);
+    }
     return true;
   }
 }
@@ -2336,6 +2550,63 @@ function framePoint(frame, local) {
   };
 }
 
+// Periodic quadratic B-spline: C1-continuous and inside its control-point hull.
+// Unlike an overshooting Catmull-Rom curve, it cannot dip under a flat floor.
+function smoothRing(points, samplesPerCorner = 3) {
+  const samples = [];
+  for (let index = 0; index < points.length; index += 1) {
+    const previous = points[(index - 1 + points.length) % points.length];
+    const current = points[index], next = points[(index + 1) % points.length];
+    for (let sample = 0; sample < samplesPerCorner; sample += 1) {
+      const t = sample / samplesPerCorner;
+      const a = 0.5 * (1 - t) * (1 - t);
+      const b = 0.5 + t - t * t;
+      const c = 0.5 * t * t;
+      samples.push({ x: previous.x * a + current.x * b + next.x * c,
+        y: previous.y * a + current.y * b + next.y * c });
+    }
+  }
+  return samples;
+}
+
+const SMOOTH_REST_RING = smoothRing(REST_RING);
+
+// Shared-edge pixels are written once into one bitmap, never alpha-composited
+// triangle by triangle. This avoids both AA seams and overlap/UV bleed stripes.
+function rasterizeTriangle(source, destination, output, texture) {
+  const [a,b,c] = destination, [sa,sb,sc] = source;
+  const denominator = (b.y-c.y)*(a.x-c.x)+(c.x-b.x)*(a.y-c.y);
+  if (Math.abs(denominator) < 1e-8) return;
+  const minX = Math.max(0,Math.floor(Math.min(a.x,b.x,c.x)));
+  const maxX = Math.min(output.width-1,Math.ceil(Math.max(a.x,b.x,c.x)));
+  const minY = Math.max(0,Math.floor(Math.min(a.y,b.y,c.y)));
+  const maxY = Math.min(output.height-1,Math.ceil(Math.max(a.y,b.y,c.y)));
+  const dw0 = (b.y-c.y)/denominator, dw1 = (c.y-a.y)/denominator;
+  for(let y=minY;y<=maxY;y++) {
+    const py=y+0.5,px=minX+0.5;
+    let w0=((b.y-c.y)*(px-c.x)+(c.x-b.x)*(py-c.y))/denominator;
+    let w1=((c.y-a.y)*(px-c.x)+(a.x-c.x)*(py-c.y))/denominator;
+    for(let x=minX;x<=maxX;x++,w0+=dw0,w1+=dw1) {
+      const w2=1-w0-w1;
+      if(w0 < -1e-7 || w1 < -1e-7 || w2 < -1e-7) continue;
+      const u=clamp(w0*sa.x+w1*sb.x+w2*sc.x,0,texture.width-1.001);
+      const v=clamp(w0*sa.y+w1*sb.y+w2*sc.y,0,texture.height-1.001);
+      const ix=Math.floor(u),iy=Math.floor(v),tx=u-ix,ty=v-iy;
+      const i=(iy*texture.width+ix)*4,j=i+texture.width*4;
+      const data=texture.data;
+      const a=(1-tx)*(1-ty)*data[i+3],b=tx*(1-ty)*data[i+7];
+      const c=(1-tx)*ty*data[j+3],d=tx*ty*data[j+7];
+      const alpha=a+b+c+d;
+      if(alpha<0.5) continue;
+      const out=(y*output.width+x)*4;
+      for(let channel=0;channel<3;channel++) {
+        output.data[out+channel]=(a*data[i+channel]+b*data[i+4+channel]+c*data[j+channel]+d*data[j+4+channel])/alpha;
+      }
+      output.data[out+3]=alpha;
+    }
+  }
+}
+
 function drawLine(context, a, b) {
   context.beginPath();
   context.moveTo(a.x, a.y);
@@ -2356,11 +2627,21 @@ class PuddingRenderer {
     this.lowPower = options.lowPower ?? false;
     this.bodyViews = new WeakMap();
     this.faceRig = new FaceRig();
+    this.texture = null;
+    this.meshSurfaces = new WeakMap();
   }
 
   setSprite(result) {
     this.sprite = result?.image ?? null;
     this.spriteAsset = result?.asset ?? PUDDING_SPRITE;
+    if (this.sprite && typeof document !== "undefined") {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 256;
+      const context = canvas.getContext("2d", {willReadFrequently:true});
+      context.imageSmoothingQuality = "high";
+      context.drawImage(this.sprite,0,0,256,256);
+      this.texture = context.getImageData(0,0,256,256);
+    }
   }
 
   setFaceParts(image, parts) {
@@ -2410,6 +2691,12 @@ class PuddingRenderer {
       .map((body) => this.displayBody(body, alpha))
       .sort((a, b) => a.particles[0].y - b.particles[0].y);
     for (const body of bodies) this.drawShadow(body, world.floorY);
+    // Physical vertices (including the fan center) are floor-constrained.
+    // Also contain texture-filter/triangle-overlap pixels, not the floor shadow.
+    context.save();
+    context.beginPath();
+    context.rect(0, 0, this.width, world.floorY);
+    context.clip();
     for (const body of bodies) {
       if (this.sprite && this.deformationMetric(body) < 2.15 && !this.debug) this.drawAffineSprite(body);
       else if (this.sprite) this.drawSpriteMesh(body);
@@ -2425,6 +2712,7 @@ class PuddingRenderer {
       }
       if (this.debug) this.drawMesh(body);
     }
+    context.restore();
   }
 
   drawBackdrop(world) {
@@ -2525,15 +2813,52 @@ class PuddingRenderer {
   drawSpriteMesh(body) {
     const context = this.context;
     const source = this.sourceMesh();
-    const destinationCenter = body.particles[0];
-    for (let index = 0; index < REST_RING.length; index += 1) {
-      const next = (index + 1) % REST_RING.length;
-      const sourceTriangle = [source.center, source.ring[index], source.ring[next]];
-      const destinationTriangle = [destinationCenter, body.particles[index + 1], body.particles[next + 1]];
+    const sourceRing = smoothRing(source.ring);
+    const destinationRing = smoothRing(body.particles.slice(1));
+    const frame = bodyFrame(body);
+    let surface = null;
+    if (this.texture) {
+      const xs=destinationRing.map(p=>p.x),ys=destinationRing.map(p=>p.y);
+      const left=Math.min(...xs)-2,top=Math.min(...ys)-2;
+      const width=Math.max(...xs)-left+2,height=Math.max(...ys)-top+2;
+      const scale=Math.min(this.dpr,1.25,320/Math.max(width,height));
+      const pixelWidth=Math.ceil(width*scale),pixelHeight=Math.ceil(height*scale);
+      surface=this.meshSurfaces.get(body);
+      if(!surface || surface.canvas.width<pixelWidth || surface.canvas.height<pixelHeight) {
+        const canvas=document.createElement("canvas");
+        canvas.width=Math.ceil(pixelWidth/16)*16;canvas.height=Math.ceil(pixelHeight/16)*16;
+        const painter=canvas.getContext("2d");
+        surface={canvas,painter,pixels:painter.createImageData(canvas.width,canvas.height)};
+        this.meshSurfaces.set(body,surface);
+      }
+      Object.assign(surface,{left,top,scale});
+      surface.pixels.data.fill(0);
+    }
+    const pointAt = (index, radius, isSource) => {
+      if (isSource) return {
+        x: source.center.x + (sourceRing[index].x - source.center.x) * radius,
+        y: source.center.y + (sourceRing[index].y - source.center.y) * radius,
+      };
+      const affine = framePoint(frame, SMOOTH_REST_RING[index]);
+      const blend = radius * radius * (3 - 2 * radius);
+      return {
+        x: frame.center.x + (affine.x - frame.center.x) * radius
+          + (destinationRing[index].x - affine.x) * blend,
+        y: frame.center.y + (affine.y - frame.center.y) * radius
+          + (destinationRing[index].y - affine.y) * blend,
+      };
+    };
+    const drawTriangle = (sourceTriangle, destinationTriangle) => {
+      if (surface) {
+        const sourceScale=this.texture.width/this.sprite.naturalWidth;
+        rasterizeTriangle(sourceTriangle.map(p=>({x:p.x*sourceScale,y:p.y*sourceScale})),
+          destinationTriangle.map(p=>({x:(p.x-surface.left)*surface.scale,y:(p.y-surface.top)*surface.scale})),
+          surface.pixels,this.texture);
+        return;
+      }
       const transform = affineForTriangle(sourceTriangle, destinationTriangle);
-      if (!transform) continue;
-
-      const clipPoints = expandedTriangle(destinationTriangle);
+      if (!transform) return;
+      const clipPoints = expandedTriangle(destinationTriangle, 0.22);
       context.save();
       context.beginPath();
       context.moveTo(clipPoints[0].x, clipPoints[0].y);
@@ -2544,7 +2869,34 @@ class PuddingRenderer {
       context.transform(transform.a, transform.b, transform.c, transform.d, transform.e, transform.f);
       context.drawImage(this.sprite, 0, 0);
       context.restore();
+    };
+    context.save();
+    context.beginPath();
+    const ring = body.particles.slice(1);
+    context.moveTo((ring.at(-1).x + ring[0].x) * 0.5, (ring.at(-1).y + ring[0].y) * 0.5);
+    for (let index = 0; index < ring.length; index += 1) {
+      const p = ring[index], next = ring[(index + 1) % ring.length];
+      context.quadraticCurveTo(p.x, p.y, (p.x + next.x) * 0.5, (p.y + next.y) * 0.5);
     }
+    context.closePath();
+    context.clip();
+    for (let index = 0; index < sourceRing.length; index += 1) {
+      const next = (index + 1) % sourceRing.length;
+      const innerSource = pointAt(index, 0.45, true), nextInnerSource = pointAt(next, 0.45, true);
+      const innerDestination = pointAt(index, 0.45, false), nextInnerDestination = pointAt(next, 0.45, false);
+      drawTriangle([source.center, innerSource, nextInnerSource],
+        [frame.center, innerDestination, nextInnerDestination]);
+      drawTriangle([innerSource, pointAt(index, 1, true), pointAt(next, 1, true)],
+        [innerDestination, pointAt(index, 1, false), pointAt(next, 1, false)]);
+      drawTriangle([innerSource, pointAt(next, 1, true), nextInnerSource],
+        [innerDestination, pointAt(next, 1, false), nextInnerDestination]);
+    }
+    if(surface) {
+      surface.painter.putImageData(surface.pixels,0,0);
+      context.drawImage(surface.canvas,surface.left,surface.top,
+        surface.canvas.width/surface.scale,surface.canvas.height/surface.scale);
+    }
+    context.restore();
   }
 
   drawVerificationShape(body) {
@@ -2722,7 +3074,7 @@ class PuddingRenderer {
   }
 }
 
-const rendererMath = Object.freeze({ affineForTriangle, barycentric, mapLocalPoint, interpolatePoint });
+const rendererMath = Object.freeze({ affineForTriangle, barycentric, mapLocalPoint, interpolatePoint, smoothRing, rasterizeTriangle });
 
 return { PuddingRenderer, rendererMath };
 })();
