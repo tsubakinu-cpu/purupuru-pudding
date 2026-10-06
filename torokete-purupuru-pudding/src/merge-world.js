@@ -1,4 +1,4 @@
-import { SoftBodyWorld, physicsMath } from "./physics.js";
+import { SoftBodyWorld, physicsMath } from "./physics.js?v=20261006-goals2";
 
 export const PUDDING_COLORS = Object.freeze([
   Object.freeze({ id: "custard", name: "カスタード", tint: "#ffd768", accent: "#fff2a6" }),
@@ -20,6 +20,8 @@ export const MERGE_RULES = Object.freeze({
   splitHoldDuration: 0.22,
   splitMergeLock: 0.9,
 });
+
+export const GOAL_RULES = Object.freeze({ collectionInterval: 0.42, flightDuration: 0.68 });
 
 const clamp = physicsMath.clamp;
 
@@ -66,6 +68,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
     this.goal = null;
     this.goalQueue = [];
     this.goalVersion = 0;
+    this.goalProgress = 0;
     this.goalRandomState = (options.goalSeed ?? 0x51f15e) >>> 0;
     this.goalScript = [...(options.goalSequence ?? [])];
     this.goalCollections = [];
@@ -145,6 +148,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
     this.goalQueue = [];
     this.goalCollections = [];
     this.goalChainOpen = false;
+    this.goalProgress = 0;
     this.comboCount = 0;
     this.comboVisibleUntil = 0;
     this.goalChainGraceUntil = 0;
@@ -408,7 +412,11 @@ export class MergePuddingWorld extends SoftBodyWorld {
   }
 
   startGoalCollection(body) {
-    if (!this.goal || !this.bodies.includes(body) || !this.goalEligible(body)) return false;
+    // Recheck at the mutation boundary: selection and collection must never
+    // disagree about the colour/tier, membership, or one-at-a-time cadence.
+    if (!body || !this.bodies.includes(body) || !this.goalMatches(body)
+      || !this.goalEligible(body) || this.time < this.nextGoalCheckAt) return false;
+    const collectedGoal = { ...this.goal };
     const continuesCombo = this.goalChainOpen;
     if (!continuesCombo) {
       this.comboCount = 0;
@@ -423,9 +431,9 @@ export class MergePuddingWorld extends SoftBodyWorld {
     const collection = {
       body,
       bodyId: body.id,
-      goal: { ...this.goal },
+      goal: collectedGoal,
       startedAt: this.time,
-      duration: 0.68,
+      duration: GOAL_RULES.flightDuration,
       comboIndex: continuesCombo ? this.comboCount + 1 : 1,
       turn: body.id % 2 === 0 ? -1 : 1,
     };
@@ -433,6 +441,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
     this.comboCount = collection.comboIndex;
     this.highestCombo = Math.max(this.highestCombo, this.comboCount);
     this.deliveredCount += 1;
+    this.goalProgress += 1;
     this.comboVisibleUntil = this.time + 1.45;
     this.comboPulseAt = this.time;
     this.goalChainOpen = true;
@@ -442,19 +451,21 @@ export class MergePuddingWorld extends SoftBodyWorld {
       bodyId: body.id,
       colorIndex: body.colorIndex,
       tier: body.tier,
+      goalVersion: collectedGoal.version,
       combo: this.comboCount,
       time: this.time,
     });
     this.events.push({
       type: "goal-collected",
       bodyId: body.id,
-      colorIndex: this.goal.colorIndex,
-      tier: this.goal.tier,
+      colorIndex: collectedGoal.colorIndex,
+      tier: collectedGoal.tier,
+      goalVersion: collectedGoal.version,
       combo: this.comboCount,
       time: this.time,
     });
     this.advanceGoalQueue();
-    this.nextGoalCheckAt = this.time + 0.1;
+    this.nextGoalCheckAt = this.time + GOAL_RULES.collectionInterval;
     return true;
   }
 
@@ -892,6 +903,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
     snapshot.hardBodyLimit = this.config.maxBodies;
     snapshot.sparkles = this.sparkles.map((sparkle) => ({ ...sparkle }));
     snapshot.goal = this.goal ? { ...this.goal } : null;
+    snapshot.goalProgress = this.goalProgress;
     snapshot.goalQueue = this.goalQueue.map((goal) => ({ ...goal }));
     snapshot.goalCollections = this.goalCollections.map((collection) => ({
       bodyId: collection.bodyId,

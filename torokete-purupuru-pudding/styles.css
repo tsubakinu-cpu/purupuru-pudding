@@ -121,10 +121,9 @@ button {
   border: 1px solid rgba(112, 65, 43, 0.14);
   border-radius: 18px;
   color: var(--ink);
-  background: rgba(255, 251, 241, 0.88);
+  background: rgba(255, 251, 241, 0.96);
   box-shadow: 0 5px 18px rgba(107, 61, 43, 0.1);
   pointer-events: none;
-  backdrop-filter: blur(10px);
 }
 
 .goal-card__heading {
@@ -180,6 +179,19 @@ button {
   align-items: end;
 }
 
+.goal-item--current.is-advancing {
+  animation: goal-advance 380ms ease-out both;
+}
+
+@keyframes goal-advance {
+  0% { transform: translateY(3px) scale(.93); box-shadow: 0 0 0 2px #df9870; }
+  100% { transform: translateY(0) scale(1); box-shadow: 0 0 0 0 transparent; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .goal-item--current.is-advancing { animation: none; }
+}
+
 .goal-item {
   display: grid;
   min-width: 0;
@@ -230,7 +242,8 @@ button {
   border-radius: 45% 45% 34% 34% / 42% 42% 24% 24%;
   background:
     radial-gradient(circle at 32% 35%, rgba(255,255,255,.85) 0 9%, transparent 11%),
-    linear-gradient(150deg, color-mix(in srgb, var(--goal-color), white 32%), var(--goal-color));
+    linear-gradient(150deg, rgba(255,255,255,.32), transparent),
+    var(--goal-color);
   box-shadow: inset 0 -3px 5px rgba(112, 67, 42, 0.12), 0 2px 3px rgba(107, 60, 41, 0.12);
 }
 

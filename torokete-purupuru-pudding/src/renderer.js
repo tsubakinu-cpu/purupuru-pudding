@@ -1,7 +1,7 @@
 import { PUDDING_SPRITE } from "./assets.js";
-import { REST_RING } from "./physics.js";
+import { REST_RING } from "./physics.js?v=20261006-goals2";
 import { FaceRig } from "./face.js";
-import { PUDDING_COLORS } from "./merge-world.js";
+import { PUDDING_COLORS } from "./merge-world.js?v=20261006-goals2";
 
 const PLACEHOLDER_COLORS = [
   ["#ffe69b", "#e8a866", "#8a4d32"],
@@ -323,6 +323,7 @@ export class PuddingRenderer {
     this.drawBackdrop(world);
 
     const alpha = clamp(interpolationAlpha, 0, 1);
+    const renderTime = Math.max(0, world.time - (1 - alpha) / 60);
     const bodies = world.bodies
       .map((body) => this.displayBody(body, alpha))
       .sort((a, b) => (a.renderOrder ?? a.createdAt) - (b.renderOrder ?? b.createdAt));
@@ -336,7 +337,7 @@ export class PuddingRenderer {
     context.clip();
     for (const body of bodies) {
       const source = Object.getPrototypeOf(body);
-      const scale = this.effectScale(source, world.time);
+      const scale = this.effectScale(source, renderTime);
       context.save();
       if (Math.abs(scale - 1) > 0.001) {
         const center = body.particles[0];
@@ -344,18 +345,18 @@ export class PuddingRenderer {
         context.scale(scale, scale);
         context.translate(-center.x, -center.y);
       }
-      if (this.sprite && this.deformationMetric(body) < 2.15 && !this.debug) this.drawAffineSprite(body);
+      if (this.sprite && !this.shouldUseMesh(body) && !this.debug) this.drawAffineSprite(body);
       else if (this.sprite) this.drawSpriteMesh(body);
       else this.drawVerificationShape(body);
-      this.drawDecoration(body, world.time);
-      this.drawCheeks(body, world.time);
+      this.drawDecoration(body, renderTime);
+      this.drawCheeks(body, renderTime);
       const state = world.faceStateFor(source);
       const gestureSurprise = source.renderGestureSurprise
         + (source.gestureSurprise - source.renderGestureSurprise) * alpha;
       const gesturePout = source.renderGesturePout + (source.gesturePout - source.renderGesturePout) * alpha;
       state.surprise = Math.max(state.surprise ?? 0, gestureSurprise);
       state.pout = Math.max(state.pout ?? 0, gesturePout);
-      const pose = this.faceRig.poseFor(source, state, world.time + alpha / 60);
+      const pose = this.faceRig.poseFor(source, state, renderTime);
       if (!this.faceRig.draw(context, body, pose, mapLocalPoint)) {
         this.drawFace(body, state.expression, pose);
       }
@@ -363,7 +364,7 @@ export class PuddingRenderer {
       if (this.debug) this.drawMesh(body);
       context.restore();
     }
-    this.drawGoalCollection(world);
+    this.drawGoalCollection(world, renderTime);
     context.restore();
     this.drawSparkles(world);
   }
@@ -436,14 +437,14 @@ export class PuddingRenderer {
     }
   }
 
-  drawGoalCollection(world) {
-    for (const collection of world.goalCollections ?? []) this.drawGoalFlight(world, collection);
+  drawGoalCollection(world, renderTime = world.time) {
+    for (const collection of world.goalCollections ?? []) this.drawGoalFlight(world, collection, renderTime);
   }
 
-  drawGoalFlight(world, collection) {
+  drawGoalFlight(world, collection, renderTime = world.time) {
     const body = collection.body;
     const center = body.particles[0];
-    const progress = clamp((world.time - collection.startedAt) / collection.duration, 0, 1);
+    const progress = clamp((renderTime - collection.startedAt) / collection.duration, 0, 1);
     const travel = 1 - Math.pow(1 - progress, 3);
     const shrink = Math.max(0.025, 1 - Math.pow(progress, 1.35));
     const target = world.goalAnchor ?? { x: this.width - 62, y: 58 };
@@ -455,13 +456,13 @@ export class PuddingRenderer {
     context.rotate(collection.turn * progress * Math.PI * 3.4);
     context.scale(shrink, shrink);
     context.translate(-center.x, -center.y);
-    if (this.sprite && this.deformationMetric(body) < 2.15 && !this.debug) this.drawAffineSprite(body);
+    if (this.sprite && !this.shouldUseMesh(body) && !this.debug) this.drawAffineSprite(body);
     else if (this.sprite) this.drawSpriteMesh(body);
     else this.drawVerificationShape(body);
-    this.drawDecoration(body, world.time);
-    this.drawCheeks(body, world.time);
+    this.drawDecoration(body, renderTime);
+    this.drawCheeks(body, renderTime);
     const state = { expression: "eek", surprise: 1, pout: 0, gazeX: 0, gazeY: -0.2 };
-    const pose = this.faceRig.poseFor(body, state, world.time);
+    const pose = this.faceRig.poseFor(body, state, renderTime);
     if (!this.faceRig.draw(context, body, pose, mapLocalPoint)) this.drawFace(body, "eek", pose);
     context.restore();
   }
@@ -542,6 +543,17 @@ export class PuddingRenderer {
     return maximum;
   }
 
+  shouldUseMesh(body) {
+    this.spriteModes ??= new WeakMap();
+    const metric = this.deformationMetric(body);
+    const wasMesh = this.spriteModes.get(body) ?? false;
+    // A 2.15px threshold used to alternate two visibly different outlines.
+    // Keep any switch subpixel and give it hysteresis instead of flickering.
+    const useMesh = metric > (wasMesh ? 0.35 : 0.85);
+    this.spriteModes.set(body, useMesh);
+    return useMesh;
+  }
+
   drawAffineSprite(body) {
     const context = this.context;
     const sprite = this.spriteFor(body);
@@ -570,6 +582,7 @@ export class PuddingRenderer {
     const sourceRing = smoothRing(source.ring);
     const destinationRing = smoothRing(body.particles.slice(1));
     const frame = bodyFrame(body);
+    this.meshStats ??= { rasterizations: 0, cacheHits: 0 };
     let surface = null;
     if (texture) {
       const xs=destinationRing.map(p=>p.x),ys=destinationRing.map(p=>p.y);
@@ -578,6 +591,28 @@ export class PuddingRenderer {
       const scale=Math.min(this.dpr,1.25,320/Math.max(width,height));
       const pixelWidth=Math.ceil(width*scale),pixelHeight=Math.ceil(height*scale);
       surface=this.meshSurfaces.get(body);
+      const determinant=frame.axisX.x*frame.axisY.y-frame.axisX.y*frame.axisY.x;
+      const geometry=destinationRing.map(p=>{
+        const dx=p.x-frame.center.x,dy=p.y-frame.center.y;
+        return {x:(dx*frame.axisY.y-dy*frame.axisY.x)/determinant,
+          y:(frame.axisX.x*dy-frame.axisX.y*dx)/determinant};
+      });
+      const materialScale=Math.max(Math.hypot(frame.axisX.x,frame.axisX.y),Math.hypot(frame.axisY.x,frame.axisY.y));
+      const reusable=surface?.geometry && surface.scale===scale
+        && geometry.every((p,i)=>Math.hypot(p.x-surface.geometry[i].x,p.y-surface.geometry[i].y)*materialScale<0.3);
+      if(reusable) {
+        const triangle=f=>[f.center,{x:f.center.x+f.axisX.x,y:f.center.y+f.axisX.y},
+          {x:f.center.x+f.axisY.x,y:f.center.y+f.axisY.y}];
+        const transport=affineForTriangle(triangle(surface.frame),triangle(frame));
+        if(transport) {
+          this.meshStats.cacheHits+=1;
+          context.save();
+          context.transform(transport.a,transport.b,transport.c,transport.d,transport.e,transport.f);
+          context.drawImage(surface.canvas,surface.left,surface.top,surface.canvas.width/scale,surface.canvas.height/scale);
+          context.restore();
+          return;
+        }
+      }
       if(!surface || surface.canvas.width<pixelWidth || surface.canvas.height<pixelHeight) {
         const canvas=document.createElement("canvas");
         canvas.width=Math.ceil(pixelWidth/16)*16;canvas.height=Math.ceil(pixelHeight/16)*16;
@@ -585,7 +620,9 @@ export class PuddingRenderer {
         surface={canvas,painter,pixels:painter.createImageData(canvas.width,canvas.height)};
         this.meshSurfaces.set(body,surface);
       }
-      Object.assign(surface,{left,top,scale});
+      this.meshStats.rasterizations += 1;
+      Object.assign(surface,{left,top,scale,geometry,
+        frame:{center:{...frame.center},axisX:{...frame.axisX},axisY:{...frame.axisY}}});
       surface.pixels.data.fill(0);
     }
     const pointAt = (index, radius, isSource) => {

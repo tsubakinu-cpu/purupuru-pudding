@@ -1,7 +1,7 @@
 import { loadOptionalImage } from "./assets.js";
 import { ToyAudio } from "./audio.js";
-import { MergePuddingWorld, PUDDING_COLORS, PUDDING_TIERS } from "./merge-world.js";
-import { PuddingRenderer } from "./renderer.js";
+import { MergePuddingWorld, PUDDING_COLORS, PUDDING_TIERS } from "./merge-world.js?v=20261006-goals2";
+import { PuddingRenderer } from "./renderer.js?v=20261006-goals2";
 import { FixedStepClock } from "./timing.js";
 import { FACE_ATLAS, FACE_PARTS } from "./face-atlas.js";
 
@@ -316,10 +316,20 @@ class PuddingToy {
         const color = PUDDING_COLORS[goal.colorIndex];
         const tier = PUDDING_TIERS[goal.tier];
         const sample = item.querySelector(".goal-sample");
+        item.dataset.goalVersion = String(goal.version);
+        item.dataset.colorIndex = String(goal.colorIndex);
         sample.dataset.tier = String(goal.tier);
         sample.style.setProperty("--goal-color", color.tint);
         item.querySelector(".goal-item__name").textContent = `${color.name}・${tier.name}`;
+        item.querySelector(".goal-item__turn").textContent = index === 0
+          ? `いま #${this.world.goalProgress + 1}` : index === 1 ? "つぎ" : "そのつぎ";
         item.setAttribute("aria-label", `${index === 0 ? "いま" : index === 1 ? "つぎ" : "そのつぎ"}：${color.name}、${tier.name}`);
+      }
+      const current = this.goalItems[0];
+      if (current && this.world.goalProgress > 0) {
+        current.classList.remove("is-advancing");
+        void current.offsetWidth;
+        current.classList.add("is-advancing");
       }
       requestAnimationFrame(() => this.onResize());
     }
@@ -434,6 +444,7 @@ class PuddingToy {
 }
 
 const game = new PuddingToy(document.querySelector("#game"));
+game.buildVersion = "20261006-goals2";
 game.initialize();
 globalThis.__puddingToy = game;
 

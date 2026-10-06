@@ -203,7 +203,9 @@ function satCollision(bodyA, bodyB, verticalBias = 1, preferredNormal = null) {
       const centerAlongHint = centerDeltaX * hintX + centerDeltaY * hintY;
       const deeplyCrossed = Math.abs(centerAlongHint) < Math.min(bodyA.width, bodyB.width) * 0.24;
       const unrelatedAxis = Math.abs(bestAxisX * hintX + bestAxisY * hintY) < 0.32;
-      if (preferredOverlap > 0 && (deeplyCrossed || unrelatedAxis)) {
+      const nearSameAxis = Math.abs(bestAxisX * hintX + bestAxisY * hintY) > 0.85
+        && preferredOverlap <= bestOverlap + 0.65;
+      if (preferredOverlap > 0 && (deeplyCrossed || unrelatedAxis || nearSameAxis)) {
         bestOverlap = preferredOverlap;
         bestAxisX = hintX;
         bestAxisY = hintY;
@@ -960,6 +962,7 @@ export class SoftBodyWorld {
       }
     }
     this.finishContacts();
+    this.dampRestingContacts(safeDt);
     for (const body of this.bodies) this.updateGestureFace(body, safeDt);
     this.recoverInvalidBodies();
   }
@@ -973,6 +976,22 @@ export class SoftBodyWorld {
       point.py = point.y;
       point.x += vx;
       point.y += vy + this.config.gravity * dt * dt;
+    }
+  }
+
+  dampRestingContacts(dt) {
+    // Constraint corrections otherwise recycle energy indefinitely in a pile.
+    // Leave the hand, throws, landing squashes and intentional little hops free.
+    const damping = Math.exp(-dt * 32);
+    for (const body of this.bodies) {
+      if (body.dragPointer !== null || (!body.isSupported && body.contactBodyIds.size === 0) || body.elasticShape
+        || this.floorY - body.particles[0].y > body.height * 3.4
+        || body.pokeDeformation || this.time - body.lastImpactAt < 0.6
+        || body.gestureStretch > 0.02 || Math.abs(body.twoGripStretch - 1) > 0.02) continue;
+      for (const point of body.particles) {
+        point.px = point.x - (point.x - point.px) * damping;
+        point.py = point.y - (point.y - point.py) * damping;
+      }
     }
   }
 
