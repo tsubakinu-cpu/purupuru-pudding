@@ -1,7 +1,7 @@
 import { PUDDING_SPRITE } from "./assets.js";
-import { REST_RING } from "./physics.js?v=20261006-goals2";
+import { REST_RING, physicsMath } from "./physics.js?v=20261006-touch3";
 import { FaceRig } from "./face.js";
-import { PUDDING_COLORS } from "./merge-world.js?v=20261006-goals2";
+import { PUDDING_COLORS } from "./merge-world.js?v=20261006-touch3";
 
 const PLACEHOLDER_COLORS = [
   ["#ffe69b", "#e8a866", "#8a4d32"],
@@ -110,22 +110,7 @@ function pathBody(context, body) {
 }
 
 function bodyFrame(body) {
-  const center = body.particles[0];
-  const right = body.particles[5];
-  const left = body.particles[11];
-  const top = body.particles[2];
-  const bottom = body.particles[8];
-  return {
-    center,
-    axisX: {
-      x: (right.x - left.x) / 0.96,
-      y: (right.y - left.y) / 0.96,
-    },
-    axisY: {
-      x: (bottom.x - top.x) / 1.03,
-      y: (bottom.y - top.y) / 1.03,
-    },
-  };
+  return physicsMath.bodyFrame(body);
 }
 
 function framePoint(frame, local) {
@@ -328,7 +313,6 @@ export class PuddingRenderer {
       .map((body) => this.displayBody(body, alpha))
       .sort((a, b) => (a.renderOrder ?? a.createdAt) - (b.renderOrder ?? b.createdAt));
     for (const body of bodies) this.drawShadow(body, world.floorY);
-    this.drawFusionBridges(world);
     // Physical vertices (including the fan center) are floor-constrained.
     // Also contain texture-filter/triangle-overlap pixels, not the floor shadow.
     context.save();
@@ -364,6 +348,7 @@ export class PuddingRenderer {
       if (this.debug) this.drawMesh(body);
       context.restore();
     }
+    this.drawFusionBridges(world);
     this.drawGoalCollection(world, renderTime);
     context.restore();
     this.drawSparkles(world);
@@ -372,7 +357,7 @@ export class PuddingRenderer {
   effectScale(body, time) {
     const mergeAge = time - (body.mergeBirthAt ?? -Infinity);
     if (mergeAge >= 0 && mergeAge < 0.62) {
-      return 1 - 0.2 * Math.exp(-mergeAge * 5.2) * Math.cos(mergeAge * 22);
+      return 1 - 0.075 * Math.exp(-mergeAge * 5.2) * Math.sin(mergeAge * 22);
     }
     const splitAge = time - (body.splitBirthAt ?? -Infinity);
     if (splitAge >= 0 && splitAge < 0.42) {
@@ -389,21 +374,24 @@ export class PuddingRenderer {
       const a = world.getBody(aId);
       const b = world.getBody(bId);
       if (!a || !b) continue;
-      const start = a.particles[0];
-      const end = b.particles[0];
+      const nx=state.nx,ny=state.ny;
+      const edgeA=Math.max(...a.particles.slice(1).map(p=>p.x*nx+p.y*ny));
+      const edgeB=Math.min(...b.particles.slice(1).map(p=>p.x*nx+p.y*ny));
+      if(Math.abs(edgeB-edgeA)>12)continue;
+      const centerA=a.particles[0],centerB=b.particles[0];
+      const tangent=((centerA.x+centerB.x)*-ny+(centerA.y+centerB.y)*nx)*.5;
+      const normal=(edgeA+edgeB)*.5;
+      const x=nx*normal-ny*tangent,y=ny*normal+nx*tangent;
       const progress = state.progress * state.progress * (3 - 2 * state.progress);
       context.save();
       context.lineCap = "round";
-      context.globalAlpha = 0.18 + progress * 0.58;
       context.strokeStyle = PUDDING_COLORS[a.colorIndex]?.tint ?? "#ffd768";
-      context.lineWidth = Math.min(a.height, b.height) * (0.08 + progress * 0.2);
+      context.lineWidth = Math.abs(edgeB-edgeA)+1+progress*3;
+      const across=Math.hypot(ny*Math.min(a.width,b.width),nx*Math.min(a.height,b.height));
+      const reach=across*(.07+progress*.28);
       context.beginPath();
-      context.moveTo(start.x, start.y);
-      context.lineTo(end.x, end.y);
-      context.stroke();
-      context.globalAlpha *= 0.66;
-      context.strokeStyle = PUDDING_COLORS[a.colorIndex]?.accent ?? "#fff2a6";
-      context.lineWidth *= 0.24;
+      context.moveTo(x-ny*reach,y+nx*reach);
+      context.lineTo(x+ny*reach,y-nx*reach);
       context.stroke();
       context.restore();
     }
@@ -740,29 +728,15 @@ export class PuddingRenderer {
       frame.center.x,
       frame.center.y,
     );
-    const mergeAge = time - (body.mergeBirthAt ?? -Infinity);
-    const decorationPop = mergeAge >= 0 && mergeAge < 0.48
-      ? 1 - 0.82 * Math.exp(-mergeAge * 8.5) * Math.cos(mergeAge * 22)
-      : 1;
-    const landingAge = time - (body.lastImpactAt ?? -Infinity) - 0.08;
-    const delayedWobble = landingAge >= 0 && landingAge < 0.72
-      ? Math.sin(landingAge * 24) * Math.exp(-landingAge * 5.2)
-      : 0;
+    const pose=physicsMath.decorationPose(body,time);
     context.translate(0, -0.51);
-    context.rotate(delayedWobble * 0.08);
-    context.scale(
-      Math.max(0.12, decorationPop) * (1 + delayedWobble * 0.055),
-      Math.max(0.12, decorationPop) * (1 - delayedWobble * 0.04),
-    );
+    context.rotate(pose.angle);
+    context.scale(pose.scaleX,pose.scaleY);
     context.translate(0, 0.51);
     context.fillStyle = "#fff8e9";
     context.strokeStyle = "rgba(116, 67, 48, .24)";
     context.lineWidth = 0.012;
-    for (const lobe of [
-      { x: -0.105, y: -0.49, rx: 0.13, ry: 0.08 },
-      { x: 0.105, y: -0.49, rx: 0.13, ry: 0.08 },
-      { x: 0, y: -0.55, rx: 0.15, ry: 0.11 },
-    ]) {
+    for (const lobe of physicsMath.CREAM_LOBES) {
       context.beginPath();
       context.ellipse(lobe.x, lobe.y, lobe.rx, lobe.ry, 0, 0, Math.PI * 2);
       context.fill();

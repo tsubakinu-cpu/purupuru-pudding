@@ -260,6 +260,46 @@ function normalizedBodyAxes(body) {
   };
 }
 
+function bodyFrame(body) {
+  const right=body.particles[5],left=body.particles[11],top=body.particles[2],bottom=body.particles[8];
+  return {center:body.particles[0],axisX:{x:(right.x-left.x)/.96,y:(right.y-left.y)/.96},
+    axisY:{x:(bottom.x-top.x)/1.03,y:(bottom.y-top.y)/1.03}};
+}
+
+const CREAM_LOBES = Object.freeze([
+  {x:-.105,y:-.49,rx:.13,ry:.08}, {x:.105,y:-.49,rx:.13,ry:.08}, {x:0,y:-.55,rx:.15,ry:.11},
+]);
+
+function decorationPose(body,time=Infinity) {
+  const mergeAge=time-(body.mergeBirthAt??-Infinity);
+  const pop=mergeAge>=0&&mergeAge<.48?1-.82*Math.exp(-mergeAge*8.5)*Math.cos(mergeAge*22):1;
+  const age=time-(body.lastImpactAt??-Infinity)-.08;
+  const wobble=age>=0&&age<.72?Math.sin(age*24)*Math.exp(-age*5.2):0;
+  const compression=body.creamCompression??0;
+  return {angle:wobble*.08,scaleX:Math.max(.12,pop)*(1+wobble*.055)*(1+compression*.22),
+    scaleY:Math.max(.12,pop)*(1-wobble*.04)*(1-compression*.62)};
+}
+
+function decorationPolygons(body,time=Infinity) {
+  if (!body.tier) return [];
+  const frame=bodyFrame(body),pose=decorationPose(body,time),cos=Math.cos(pose.angle),sin=Math.sin(pose.angle);
+  const shapes=body.tier>=2?[...CREAM_LOBES,{x:0,y:-.65,rx:.09,ry:.09}]:CREAM_LOBES;
+  return shapes.map(shape=>Array.from({length:16},(_,i)=>{
+    const angle=i/16*Math.PI*2;
+    const localX=(shape.x+Math.cos(angle)*shape.rx)*pose.scaleX;
+    const localY=(shape.y+.51+Math.sin(angle)*shape.ry)*pose.scaleY;
+    const x=localX*cos-localY*sin,y=-.51+localX*sin+localY*cos;
+    return {x:frame.center.x+frame.axisX.x*x+frame.axisY.x*y,
+      y:frame.center.y+frame.axisX.y*x+frame.axisY.y*y};
+  }));
+}
+
+function polygonBody(points) {
+  const center={x:0,y:0};for(const p of points){center.x+=p.x/points.length;center.y+=p.y/points.length;}
+  const xs=points.map(p=>p.x),ys=points.map(p=>p.y);
+  return {particles:[center,...points],width:Math.max(...xs)-Math.min(...xs),height:Math.max(...ys)-Math.min(...ys)};
+}
+
 function gripAtPoint(body, x, y) {
   const center = body.particles[0];
   for (let index = 1; index < body.particles.length; index += 1) {
@@ -377,6 +417,17 @@ function solveDistanceConstraint(body, constraint) {
   if (weight < EPSILON) return;
 
   let restLength = constraint.rest;
+  if (body.fusionPose) {
+    const pose=body.fusionPose;
+    const localA=constraint.a===0?{x:0,y:0}:REST_RING[constraint.a-1];
+    const localB=constraint.b===0?{x:0,y:0}:REST_RING[constraint.b-1];
+    const rx=(localB.x-localA.x)*body.width,ry=(localB.y-localA.y)*body.height;
+    const wx=pose.axes.ux*rx+pose.axes.vx*ry,wy=pose.axes.uy*rx+pose.axes.vy*ry;
+    const parallel=wx*pose.nx+wy*pose.ny;
+    const tx=(wx-pose.nx*parallel)*pose.transverseScale+pose.nx*parallel*pose.normalScale;
+    const ty=(wy-pose.ny*parallel)*pose.transverseScale+pose.ny*parallel*pose.normalScale;
+    restLength=Math.hypot(tx,ty);
+  }
   if ((body.floorCompression > 0.002 && body.floorAxes) || Math.abs(body.twoGripStretch - 1) > 0.002) {
     const localA = constraint.a === 0 ? { x: 0, y: 0 } : REST_RING[constraint.a - 1];
     const localB = constraint.b === 0 ? { x: 0, y: 0 } : REST_RING[constraint.b - 1];
@@ -403,7 +454,8 @@ function solveDistanceConstraint(body, constraint) {
 function solveAreaConstraint(body) {
   const ring = bodyRing(body);
   const currentArea = polygonArea(ring);
-  const difference = currentArea - body.restArea * Math.sqrt(body.twoGripStretch);
+  const fusionArea=body.fusionPose?body.fusionPose.normalScale*body.fusionPose.transverseScale:1;
+  const difference = currentArea - body.restArea * Math.sqrt(body.twoGripStretch)*fusionArea;
   if (!Number.isFinite(difference) || Math.abs(difference) < 0.001) return;
 
   const gradients = [];
@@ -938,6 +990,7 @@ export class SoftBodyWorld {
         this.solvePokeDeformation(body);
         this.solveTransientShape(body);
         this.solveFloorCompression(body);
+        this.solveAdditionalShape(body);
         solveMeshOrientation(body);
       }
       this.solveBodyCollisions();
@@ -978,6 +1031,8 @@ export class SoftBodyWorld {
       point.y += vy + this.config.gravity * dt * dt;
     }
   }
+
+  solveAdditionalShape() {}
 
   dampRestingContacts(dt) {
     // Constraint corrections otherwise recycle energy indefinitely in a pile.
@@ -1350,7 +1405,7 @@ export class SoftBodyWorld {
   updateGestureFace(body, dt) {
     body.actualStretch += (materialStretch(body)-body.actualStretch)*(1-Math.exp(-dt/0.035));
     const held=body.dragPointer!==null;
-    if(!held) body.isStretchCrying=false;
+    if(!held || body.fusionPose) body.isStretchCrying=false;
     else if(!body.isStretchCrying && body.actualStretch>1.18) body.isStretchCrying=true;
     else if(body.isStretchCrying && body.actualStretch<1.10) body.isStretchCrying=false;
     const targetSurprise = clamp(body.gestureStretch * 1.1, 0, 1);
@@ -1613,10 +1668,10 @@ export class SoftBodyWorld {
           const dragA = this.bodyDrags(a).length === 1 ? this.bodyDrags(a)[0] : null;
           const dragB = this.bodyDrags(b).length === 1 ? this.bodyDrags(b)[0] : null;
           const initialA = dragA
-            ? { x: dragA.startX + dragA.offsetX, y: dragA.startY + dragA.offsetY }
+            ? { x: dragA.collisionAnchorX ?? dragA.startX + dragA.offsetX, y: dragA.collisionAnchorY ?? dragA.startY + dragA.offsetY }
             : a.particles[0];
           const initialB = dragB
-            ? { x: dragB.startX + dragB.offsetX, y: dragB.startY + dragB.offsetY }
+            ? { x: dragB.collisionAnchorX ?? dragB.startX + dragB.offsetX, y: dragB.collisionAnchorY ?? dragB.startY + dragB.offsetY }
             : b.particles[0];
           const hintX = initialB.x - initialA.x;
           const hintY = initialB.y - initialA.y;
@@ -1886,4 +1941,10 @@ export const physicsMath = Object.freeze({
   pointInPolygon,
   bodyAabb,
   satCollision,
+  bodyFrame,
+  CREAM_LOBES,
+  normalizedBodyAxes,
+  decorationPose,
+  decorationPolygons,
+  polygonBody,
 });

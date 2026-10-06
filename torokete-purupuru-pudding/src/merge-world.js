@@ -1,4 +1,4 @@
-import { SoftBodyWorld, physicsMath } from "./physics.js?v=20261006-goals2";
+import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261006-touch3";
 
 export const PUDDING_COLORS = Object.freeze([
   Object.freeze({ id: "custard", name: "カスタード", tint: "#ffd768", accent: "#fff2a6" }),
@@ -34,6 +34,27 @@ function bodyVelocity(body) {
   return { x: center.x - center.px, y: center.y - center.py };
 }
 
+function mergeContour(a,b,x,y) {
+  const points=[...a.particles.slice(1),...b.particles.slice(1)].map(p=>({x:p.x,y:p.y}))
+    .sort((a,b)=>a.x-b.x||a.y-b.y);
+  const cross=(a,b,c)=>(b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+  const half=values=>{const hull=[];for(const p of values){while(hull.length>1&&cross(hull.at(-2),hull.at(-1),p)<=0)hull.pop();hull.push(p);}return hull;};
+  const hull=[...half(points).slice(0,-1),...half([...points].reverse()).slice(0,-1)];
+  return REST_RING.map(rest=>{
+    const dx=rest.x*a.width,dy=rest.y*a.height;
+    let distance=Infinity;
+    for(let i=0;i<hull.length;i++) {
+      const p=hull[i],q=hull[(i+1)%hull.length],ex=q.x-p.x,ey=q.y-p.y;
+      const denominator=dx*ey-dy*ex;
+      if(Math.abs(denominator)<.00001)continue;
+      const t=((p.x-x)*ey-(p.y-y)*ex)/denominator;
+      const u=((p.x-x)*dy-(p.y-y)*dx)/denominator;
+      if(t>=0&&u>=0&&u<=1)distance=Math.min(distance,t);
+    }
+    return Number.isFinite(distance)?{x:x+dx*distance,y:y+dy*distance}:{x:x+dx,y:y+dy};
+  });
+}
+
 function paddedOverlap(a, b, padding = 0) {
   const aa = physicsMath.bodyAabb(a);
   const bb = physicsMath.bodyAabb(b);
@@ -54,6 +75,15 @@ function seededRandom(seed) {
   };
 }
 
+function randomUnit() {
+  if (globalThis.crypto?.getRandomValues) {
+    const value = new Uint32Array(1);
+    globalThis.crypto.getRandomValues(value);
+    return value[0] / 4294967296;
+  }
+  return Math.random();
+}
+
 export class MergePuddingWorld extends SoftBodyWorld {
   constructor(options = {}) {
     const hardMaxBodies = options.maxBodies ?? 16;
@@ -63,13 +93,14 @@ export class MergePuddingWorld extends SoftBodyWorld {
     this.sparkles = [];
     this.nextRenderOrder = 1;
     this.addColorCursor = 0;
-    this.dropRandomState = (options.dropSeed ?? 0x9e3779b9) >>> 0;
+    // Determinism is an explicit test option, never a production default.
+    this.dropRandomState = options.dropSeed === undefined ? null : options.dropSeed >>> 0;
     this.nextDropColorIndex = this.rollDropColor();
     this.goal = null;
     this.goalQueue = [];
     this.goalVersion = 0;
     this.goalProgress = 0;
-    this.goalRandomState = (options.goalSeed ?? 0x51f15e) >>> 0;
+    this.goalRandomState = options.goalSeed === undefined ? null : options.goalSeed >>> 0;
     this.goalScript = [...(options.goalSequence ?? [])];
     this.goalCollections = [];
     this.goalAnchor = { x: this.width - 62, y: 58 };
@@ -121,6 +152,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
       idleReactionCooldownUntil: 0,
       goalReadyAt: options.goalReadyAt ?? this.time + (tier === PUDDING_TIERS.length - 1 ? 0.95 : 0.38),
       goalCollecting: false,
+      creamCompression: 0,
     });
     this.nextRenderOrder += 1;
     this.addColorCursor = (colorIndex + 1) % PUDDING_COLORS.length;
@@ -128,6 +160,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
   }
 
   rollDropColor() {
+    if (this.dropRandomState === null) return Math.floor(randomUnit() * PUDDING_COLORS.length);
     this.dropRandomState = (Math.imul(this.dropRandomState, 1103515245) + 12345) >>> 0;
     return Math.floor((this.dropRandomState / 4294967296) * PUDDING_COLORS.length);
   }
@@ -168,9 +201,10 @@ export class MergePuddingWorld extends SoftBodyWorld {
         x: this.width * 0.5 + (index - (total - 1) * 0.5) * spacing,
         y: Math.max(58, this.floorY - 154 - (index % 2) * 24),
         vx: (index - (total - 1) * 0.5) * 8,
+        goalReadyAt: this.time + 1.5,
       });
     }
-    this.resetGoalQueue({ avoidExisting: true });
+    this.resetGoalQueue();
   }
 
   beginDrag(pointerId, x, y, options = {}) {
@@ -183,6 +217,9 @@ export class MergePuddingWorld extends SoftBodyWorld {
       this.wakeBody(body, false);
       const drag = this.drags.get(pointerId);
       const center = body.particles[0];
+      if(drag.centerGrip && !physicsMath.pointInPolygon(x,y,body.particles.slice(1))) {
+        drag.inputOffsetX=x-center.x;drag.inputOffsetY=y-center.y;
+      }
       drag.orderConstraints = this.bodies
         .filter((candidate) => candidate !== body)
         .map((candidate) => {
@@ -195,10 +232,19 @@ export class MergePuddingWorld extends SoftBodyWorld {
             ny: dy / length,
             anchorX: candidate.particles[0].x,
             anchorY: candidate.particles[0].y,
+            pointerAnchorX: center.x,
+            pointerAnchorY: center.y,
           };
         });
     }
     return body;
+  }
+
+  hitTest(x,y,excludedBodyIds=null) {
+    const bodies=[...this.bodies].sort((a,b)=>(b.renderOrder??b.id)-(a.renderOrder??a.id));
+    return bodies.find(body=>!excludedBodyIds?.has(body.id) && (
+      physicsMath.pointInPolygon(x,y,body.particles.slice(1))
+      || physicsMath.decorationPolygons(body,this.time).some(ring=>physicsMath.pointInPolygon(x,y,ring))))??null;
   }
 
   moveDrag(pointerId, x, y, options = {}) {
@@ -225,12 +271,32 @@ export class MergePuddingWorld extends SoftBodyWorld {
     let y = target.y;
     for (const constraint of drag.orderConstraints ?? []) {
       const other = this.getBody(constraint.bodyId);
-      if (!other || this.pairCanFuse(drag.body, other)) continue;
+      if (!other) continue;
       const desiredCenterX = x - gripOffset.x;
       const desiredCenterY = y - gripOffset.y;
-      const separation = (constraint.anchorX - desiredCenterX) * constraint.nx
-        + (constraint.anchorY - desiredCenterY) * constraint.ny;
-      const minimumGap = 0.2 * (
+      const center=drag.body.particles[0],otherCenter=other.particles[0];
+      const dx=desiredCenterX-center.x,dy=desiredCenterY-center.y;
+      const t=clamp(((otherCenter.x-center.x)*dx+(otherCenter.y-center.y)*dy)/Math.max(.001,dx*dx+dy*dy),0,1);
+      const at=fraction=>({...drag.body,particles:drag.body.particles.map(p=>({x:p.x+dx*fraction,y:p.y+dy*fraction}))});
+      // The previous infinite half-plane also blocked gestures far above the
+      // pudding. Only retain its no-crossing guard along a real blocked path.
+      const tangentialMove=Math.abs((desiredCenterX-constraint.pointerAnchorX)*-constraint.ny
+        +(desiredCenterY-constraint.pointerAnchorY)*constraint.nx);
+      const clearance=.52*(Math.abs(constraint.ny)*(drag.body.width+other.width)
+        +Math.abs(constraint.nx)*(drag.body.height+other.height));
+      if (tangentialMove>clearance && !physicsMath.satCollision(at(1),other) && !physicsMath.satCollision(at(t),other)) {
+        const nx=otherCenter.x-desiredCenterX,ny=otherCenter.y-desiredCenterY,length=Math.max(.001,Math.hypot(nx,ny));
+        constraint.nx=nx/length;constraint.ny=ny/length;
+        constraint.pointerAnchorX=desiredCenterX;constraint.pointerAnchorY=desiredCenterY;
+        drag.collisionAnchorX=center.x;drag.collisionAnchorY=center.y;
+        this.contactNormals.delete(pairKey(drag.body,other));
+        continue;
+      }
+      const separation = (otherCenter.x - desiredCenterX) * constraint.nx
+        + (otherCenter.y - desiredCenterY) * constraint.ny;
+      const compatible=this.pairCanFuse(drag.body,other);
+      const scale=compatible?Math.min(drag.body.fusionPose?.normalScale??1,other.fusionPose?.normalScale??1):1;
+      const minimumGap = (compatible?.49:.2)*scale * (
         Math.abs(constraint.nx) * (drag.body.width + other.width)
         + Math.abs(constraint.ny) * (drag.body.height + other.height)
       );
@@ -260,6 +326,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
     super.step(dt);
     const elapsed = this.time - before;
     if (elapsed <= 0) return;
+    this.solveDecorationContacts(elapsed);
     const stepEvents = this.events.slice(eventStart);
     this.updateSparkles(elapsed);
     this.updateIdleLife(elapsed, stepEvents);
@@ -267,6 +334,40 @@ export class MergePuddingWorld extends SoftBodyWorld {
     this.updateFusion(elapsed);
     this.updateGoalSystem();
     this.advanceModeClock(elapsed);
+  }
+
+  solveDecorationContacts(dt) {
+    const bounds=new Map(this.bodies.map(body=>[body,physicsMath.bodyAabb(body)]));
+    for (const owner of this.bodies) {
+      if (!owner.tier) continue;
+      let compression=0;
+      const caps=physicsMath.decorationPolygons(owner,this.time).map(ring=>{
+        const body=physicsMath.polygonBody(ring);return {body,bounds:physicsMath.bodyAabb(body)};
+      });
+      for (const other of this.bodies) {
+        if(other===owner || owner.fusionProgress>.02 || other.fusionProgress>.02) continue;
+        let contact=null;
+        for(const cap of caps) {
+          const box=bounds.get(other),cb=cap.bounds;
+          if(box.maxX<cb.minX||box.minX>cb.maxX||box.maxY<cb.minY||box.minY>cb.maxY)continue;
+          const hit=physicsMath.satCollision(cap.body,other);
+          if(hit && (!contact||hit.overlap>contact.overlap)) contact=hit;
+        }
+        if(!contact) continue;
+        compression=Math.max(compression,clamp(contact.overlap/(owner.height*.11),0,.72));
+        if(other.dragPointer!==null) continue;
+        const amount=Math.min(contact.overlap,5)*.4;
+        for(const p of other.particles) {
+          const vx=p.x-p.px,vy=p.y-p.py,normal=vx*contact.nx+vy*contact.ny;
+          const kept=Math.min(0,normal)*.78;
+          p.x+=contact.nx*amount;p.y+=contact.ny*amount;
+          p.px=p.x-vx+contact.nx*kept;p.py=p.y-vy+contact.ny*kept;
+        }
+        this.solveBounds(other,dt);
+        if(contact.ny<-.5) {other.isSupported=true;other.supportBodyId=owner.id;other.airborneSteps=0;other.isScared=false;}
+      }
+      owner.creamCompression+=(compression-owner.creamCompression)*(1-Math.exp(-dt/.065));
+    }
   }
 
   startTimedMode(seconds = 120) {
@@ -311,6 +412,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
   }
 
   nextGoalRandom() {
+    if (this.goalRandomState === null) return randomUnit();
     this.goalRandomState = (Math.imul(this.goalRandomState, 1664525) + 1013904223) >>> 0;
     return this.goalRandomState / 4294967296;
   }
@@ -319,30 +421,14 @@ export class MergePuddingWorld extends SoftBodyWorld {
     return Boolean(goal) && body.colorIndex === goal.colorIndex && body.tier === goal.tier;
   }
 
-  makeGoal(options = {}) {
-    const previous = options.previous ?? this.goalQueue.at(-1) ?? this.goal;
-    let chosen = null;
-    for (let attempt = 0; attempt < 24; attempt += 1) {
-      const scripted = this.goalScript.length > 0 ? this.goalScript.shift() : null;
-      const candidate = scripted ?? {
-        colorIndex: Math.floor(this.nextGoalRandom() * PUDDING_COLORS.length),
-        tier: Math.floor(this.nextGoalRandom() * PUDDING_TIERS.length),
-      };
-      const normalized = {
-        colorIndex: clamp(Math.round(candidate.colorIndex ?? 0), 0, PUDDING_COLORS.length - 1),
-        tier: clamp(Math.round(candidate.tier ?? 0), 0, PUDDING_TIERS.length - 1),
-      };
-      const repeats = previous
-        && normalized.colorIndex === previous.colorIndex
-        && normalized.tier === previous.tier;
-      const exists = this.bodies.some((body) => this.goalMatches(body, normalized));
-      if ((!options.avoidExisting || !exists) && (!repeats || attempt > 10)) {
-        chosen = normalized;
-        break;
-      }
-      chosen = normalized;
-    }
-    const normalized = chosen ?? { colorIndex: 0, tier: 1 };
+  makeGoal() {
+    const choice = Math.floor(this.nextGoalRandom() * PUDDING_COLORS.length * PUDDING_TIERS.length);
+    const candidate = this.goalScript.length > 0 ? this.goalScript.shift()
+      : { colorIndex: choice % PUDDING_COLORS.length, tier: Math.floor(choice / PUDDING_COLORS.length) };
+    const normalized = {
+      colorIndex: clamp(Math.round(candidate.colorIndex ?? 0), 0, PUDDING_COLORS.length - 1),
+      tier: clamp(Math.round(candidate.tier ?? 0), 0, PUDDING_TIERS.length - 1),
+    };
     this.goalVersion += 1;
     return { ...normalized, version: this.goalVersion };
   }
@@ -371,10 +457,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
       };
     });
     while (this.goalQueue.length < 3) {
-      this.goalQueue.push(this.makeGoal({
-        avoidExisting: options.avoidExisting && this.goalQueue.length === 0,
-        previous: this.goalQueue.at(-1),
-      }));
+      this.goalQueue.push(this.makeGoal());
     }
     return this.syncCurrentGoal(options);
   }
@@ -383,20 +466,17 @@ export class MergePuddingWorld extends SoftBodyWorld {
     return this.setGoalQueue([goal], options);
   }
 
-  resetGoalQueue(options = {}) {
+  resetGoalQueue() {
     this.goalQueue = [];
     while (this.goalQueue.length < 3) {
-      this.goalQueue.push(this.makeGoal({
-        avoidExisting: options.avoidExisting && this.goalQueue.length === 0,
-        previous: this.goalQueue.at(-1),
-      }));
+      this.goalQueue.push(this.makeGoal());
     }
     return this.syncCurrentGoal({ immediate: false });
   }
 
   advanceGoalQueue() {
     this.goalQueue.shift();
-    this.goalQueue.push(this.makeGoal({ previous: this.goalQueue.at(-1) }));
+    this.goalQueue.push(this.makeGoal());
     return this.syncCurrentGoal({ immediate: false });
   }
 
@@ -666,20 +746,35 @@ export class MergePuddingWorld extends SoftBodyWorld {
   }
 
   contactResponse(a, b) {
-    if (!this.pairCanFuse(a, b)) return 1;
-    const dragsA = this.bodyDrags(a);
-    const dragsB = this.bodyDrags(b);
-    if (dragsA.length > 1 || dragsB.length > 1 || dragsA.length + dragsB.length === 0) return 1;
-    const pressure = this.fusionPressure(a, b);
-    if (pressure >= 0.15) return 0.008;
-    if (pressure >= 0.03) return 0.18;
+    // Intention changes the material rest shape, never its opacity or solidity.
     return 1;
+  }
+
+  solveAdditionalShape(body) {
+    const pose=body.fusionPose;
+    if(!pose)return;
+    const center=body.particles[0];
+    const correctionX=(pose.centerX-center.x)*.3,correctionY=(pose.centerY-center.y)*.3;
+    for(const point of body.particles) {
+      point.x+=correctionX;point.y+=correctionY;
+      point.px+=correctionX;point.py+=correctionY;
+    }
+    for(let i=0;i<REST_RING.length;i++) {
+      const rest=REST_RING[i],rx=rest.x*body.width,ry=rest.y*body.height;
+      const wx=pose.axes.ux*rx+pose.axes.vx*ry,wy=pose.axes.uy*rx+pose.axes.vy*ry;
+      const normal=wx*pose.nx+wy*pose.ny;
+      const x=pose.nx*normal*pose.normalScale+(wx-pose.nx*normal)*pose.transverseScale;
+      const y=pose.ny*normal*pose.normalScale+(wy-pose.ny*normal)*pose.transverseScale;
+      const point=body.particles[i+1];
+      point.x+=(center.x+x-point.x)*.24;point.y+=(center.y+y-point.y)*.24;
+    }
   }
 
   updateFusion(dt) {
     for (const body of this.bodies) {
       body.fusionProgress = 0;
       body.mergeGazeTargetId = null;
+      body.fusionPose = null;
     }
     const candidates = [];
     const validKeys = new Set();
@@ -692,7 +787,11 @@ export class MergePuddingWorld extends SoftBodyWorld {
         if (!maximumPair && a.colorIndex !== b.colorIndex) continue;
         const key = pairKey(a, b);
         validKeys.add(key);
-        const state = this.fusionPairs.get(key) ?? { progress: 0, pressure: 0 };
+        const state = this.fusionPairs.get(key) ?? { progress: 0, pressure: 0,
+          axesA:physicsMath.normalizedBodyAxes(a),axesB:physicsMath.normalizedBodyAxes(b),
+          centerA:{x:a.particles[0].x,y:a.particles[0].y},centerB:{x:b.particles[0].x,y:b.particles[0].y},
+          nx:(b.particles[0].x-a.particles[0].x)/Math.max(.001,Math.hypot(b.particles[0].x-a.particles[0].x,b.particles[0].y-a.particles[0].y)),
+          ny:(b.particles[0].y-a.particles[0].y)/Math.max(.001,Math.hypot(b.particles[0].x-a.particles[0].x,b.particles[0].y-a.particles[0].y)) };
         this.fusionPairs.set(key, state);
         const dragsA = this.bodyDrags(a);
         const dragsB = this.bodyDrags(b);
@@ -721,6 +820,12 @@ export class MergePuddingWorld extends SoftBodyWorld {
     for (const candidate of candidates) {
       const available = !claimed.has(candidate.a.id) && !claimed.has(candidate.b.id);
       if (available && candidate.active) {
+        if(candidate.state.progress===0) {
+          const {a,b,state}=candidate,dx=b.particles[0].x-a.particles[0].x,dy=b.particles[0].y-a.particles[0].y;
+          const length=Math.max(.001,Math.hypot(dx,dy));state.nx=dx/length;state.ny=dy/length;
+          state.axesA=physicsMath.normalizedBodyAxes(a);state.axesB=physicsMath.normalizedBodyAxes(b);
+          state.centerA={x:a.particles[0].x,y:a.particles[0].y};state.centerB={x:b.particles[0].x,y:b.particles[0].y};
+        }
         claimed.add(candidate.a.id);
         claimed.add(candidate.b.id);
         candidate.state.progress = Math.min(
@@ -738,6 +843,22 @@ export class MergePuddingWorld extends SoftBodyWorld {
       if (candidate.state.progress > 0.04) {
         candidate.a.mergeGazeTargetId = candidate.b.id;
         candidate.b.mergeGazeTargetId = candidate.a.id;
+      }
+      if(candidate.state.progress>0 && available) {
+        const {a,b,state}=candidate,p=state.progress*state.progress*(3-2*state.progress);
+        const next=PUDDING_TIERS[Math.min(a.tier+1,PUDDING_TIERS.length-1)];
+        const sourceReach=Math.hypot(state.nx*a.width,state.ny*a.height);
+        const nextReach=Math.hypot(state.nx*next.width,state.ny*next.height);
+        const sourceAcross=Math.hypot(state.ny*a.width,state.nx*a.height);
+        const nextAcross=Math.hypot(state.ny*next.width,state.nx*next.height);
+        const normalScale=1+(nextReach/(2*sourceReach)-1)*p;
+        const transverseScale=1+(nextAcross/sourceAcross-1)*p;
+        const midX=(state.centerA.x+state.centerB.x)*.5,midY=(state.centerA.y+state.centerB.y)*.5;
+        const pose={nx:state.nx,ny:state.ny,normalScale,transverseScale};
+        a.fusionPose={...pose,axes:state.axesA,centerX:midX+(state.centerA.x-midX)*normalScale,
+          centerY:midY+(state.centerA.y-midY)*normalScale};
+        b.fusionPose={...pose,axes:state.axesB,centerX:midX+(state.centerB.x-midX)*normalScale,
+          centerY:midY+(state.centerB.y-midY)*normalScale};
       }
       if (candidate.state.progress >= 1) completed.push(candidate);
     }
@@ -775,6 +896,7 @@ export class MergePuddingWorld extends SoftBodyWorld {
     const y = (centerA.y + centerB.y) * 0.5;
     const velocityA = bodyVelocity(a);
     const velocityB = bodyVelocity(b);
+    const contour=mergeContour(a,b,x,y);
     const sourceIds = [a.id, b.id];
     this.removeBodies([a, b]);
 
@@ -804,7 +926,12 @@ export class MergePuddingWorld extends SoftBodyWorld {
       mergeBirthAt: this.time,
     });
     if (merged) {
-      this.startElasticShape(merged, 0.62);
+      contour.forEach((position,index)=>{
+        const point=merged.particles[index+1],vx=point.x-point.px,vy=point.y-point.py;
+        point.x=position.x;point.y=position.y;point.px=point.x-vx;point.py=point.y-vy;
+        point.renderX=point.x;point.renderY=point.y;
+      });
+      this.startElasticShape(merged, 0.14);
       this.setExpression(merged, "surprised", 0.38, "sly", 0.48);
     }
     this.events.push({

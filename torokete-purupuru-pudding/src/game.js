@@ -1,7 +1,7 @@
 import { loadOptionalImage } from "./assets.js";
 import { ToyAudio } from "./audio.js";
-import { MergePuddingWorld, PUDDING_COLORS, PUDDING_TIERS } from "./merge-world.js?v=20261006-goals2";
-import { PuddingRenderer } from "./renderer.js?v=20261006-goals2";
+import { MergePuddingWorld, PUDDING_COLORS, PUDDING_TIERS } from "./merge-world.js?v=20261006-touch3";
+import { PuddingRenderer } from "./renderer.js?v=20261006-touch3";
 import { FixedStepClock } from "./timing.js";
 import { FACE_ATLAS, FACE_PARTS } from "./face-atlas.js";
 
@@ -444,7 +444,7 @@ class PuddingToy {
 }
 
 const game = new PuddingToy(document.querySelector("#game"));
-game.buildVersion = "20261006-goals2";
+game.buildVersion = "20261006-touch3";
 game.initialize();
 globalThis.__puddingToy = game;
 
