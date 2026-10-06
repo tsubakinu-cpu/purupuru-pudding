@@ -1,7 +1,7 @@
 import { PUDDING_SPRITE } from "./assets.js";
-import { REST_RING, physicsMath } from "./physics.js?v=20261006-contact4";
+import { REST_RING, physicsMath } from "./physics.js?v=20261006-smooth7";
 import { FaceRig } from "./face.js";
-import { PUDDING_COLORS } from "./merge-world.js?v=20261006-contact4";
+import { PUDDING_COLORS } from "./merge-world.js?v=20261006-smooth7";
 
 const PLACEHOLDER_COLORS = [
   ["#ffe69b", "#e8a866", "#8a4d32"],
@@ -152,6 +152,7 @@ function rasterizeTriangle(source, destination, output, texture) {
   const minY = Math.max(0,Math.floor(Math.min(a.y,b.y,c.y)));
   const maxY = Math.min(output.height-1,Math.ceil(Math.max(a.y,b.y,c.y)));
   const dw0 = (b.y-c.y)/denominator, dw1 = (c.y-a.y)/denominator;
+  const data=texture.data, pixels=output.data;
   for(let y=minY;y<=maxY;y++) {
     const py=y+0.5,px=minX+0.5;
     let w0=((b.y-c.y)*(px-c.x)+(c.x-b.x)*(py-c.y))/denominator;
@@ -163,16 +164,15 @@ function rasterizeTriangle(source, destination, output, texture) {
       const v=clamp(w0*sa.y+w1*sb.y+w2*sc.y,0,texture.height-1.001);
       const ix=Math.floor(u),iy=Math.floor(v),tx=u-ix,ty=v-iy;
       const i=(iy*texture.width+ix)*4,j=i+texture.width*4;
-      const data=texture.data;
       const a=(1-tx)*(1-ty)*data[i+3],b=tx*(1-ty)*data[i+7];
       const c=(1-tx)*ty*data[j+3],d=tx*ty*data[j+7];
       const alpha=a+b+c+d;
       if(alpha<0.5) continue;
       const out=(y*output.width+x)*4;
-      for(let channel=0;channel<3;channel++) {
-        output.data[out+channel]=(a*data[i+channel]+b*data[i+4+channel]+c*data[j+channel]+d*data[j+4+channel])/alpha;
-      }
-      output.data[out+3]=alpha;
+      pixels[out]=(a*data[i]+b*data[i+4]+c*data[j]+d*data[j+4])/alpha;
+      pixels[out+1]=(a*data[i+1]+b*data[i+5]+c*data[j+1]+d*data[j+5])/alpha;
+      pixels[out+2]=(a*data[i+2]+b*data[i+6]+c*data[j+2]+d*data[j+6])/alpha;
+      pixels[out+3]=alpha;
     }
   }
 }
@@ -206,6 +206,7 @@ export class PuddingRenderer {
   setSprite(result) {
     this.sprite = result?.image ?? null;
     this.spriteAsset = result?.asset ?? PUDDING_SPRITE;
+    this.sourceRingCache = null;
     if (this.sprite && typeof document !== "undefined") {
       this.prepareSpriteVariants();
     }
@@ -294,7 +295,7 @@ export class PuddingRenderer {
       record = { view, particles };
       this.bodyViews.set(body, record);
     }
-    const alpha = body.dragPointer === null ? interpolationAlpha : 1;
+    const alpha = interpolationAlpha;
     for (let index = 0; index < body.particles.length; index += 1) {
       interpolatePoint(body.particles[index], alpha, record.particles[index]);
     }
@@ -567,7 +568,7 @@ export class PuddingRenderer {
     const sprite = this.spriteFor(body);
     const texture = this.textureFor(body);
     const source = this.sourceMesh();
-    const sourceRing = smoothRing(source.ring);
+    const sourceRing = this.sourceRingCache ??= smoothRing(source.ring);
     const destinationRing = smoothRing(body.particles.slice(1));
     const frame = bodyFrame(body);
     this.meshStats ??= { rasterizations: 0, cacheHits: 0 };
@@ -649,6 +650,9 @@ export class PuddingRenderer {
       context.drawImage(sprite, 0, 0);
       context.restore();
     };
+    const innerSource=sourceRing.map((_,i)=>pointAt(i,.45,true));
+    const outerSource=sourceRing;
+    const innerDestination=destinationRing.map((_,i)=>pointAt(i,.45,false));
     context.save();
     context.beginPath();
     const ring = body.particles.slice(1);
@@ -661,14 +665,12 @@ export class PuddingRenderer {
     context.clip();
     for (let index = 0; index < sourceRing.length; index += 1) {
       const next = (index + 1) % sourceRing.length;
-      const innerSource = pointAt(index, 0.45, true), nextInnerSource = pointAt(next, 0.45, true);
-      const innerDestination = pointAt(index, 0.45, false), nextInnerDestination = pointAt(next, 0.45, false);
-      drawTriangle([source.center, innerSource, nextInnerSource],
-        [frame.center, innerDestination, nextInnerDestination]);
-      drawTriangle([innerSource, pointAt(index, 1, true), pointAt(next, 1, true)],
-        [innerDestination, pointAt(index, 1, false), pointAt(next, 1, false)]);
-      drawTriangle([innerSource, pointAt(next, 1, true), nextInnerSource],
-        [innerDestination, pointAt(next, 1, false), nextInnerDestination]);
+      drawTriangle([source.center, innerSource[index], innerSource[next]],
+        [frame.center, innerDestination[index], innerDestination[next]]);
+      drawTriangle([innerSource[index], outerSource[index], outerSource[next]],
+        [innerDestination[index], destinationRing[index], destinationRing[next]]);
+      drawTriangle([innerSource[index], outerSource[next], innerSource[next]],
+        [innerDestination[index], destinationRing[next], innerDestination[next]]);
     }
     if(surface) {
       surface.painter.putImageData(surface.pixels,0,0);

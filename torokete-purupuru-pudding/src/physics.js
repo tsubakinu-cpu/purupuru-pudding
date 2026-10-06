@@ -1038,13 +1038,27 @@ export class SoftBodyWorld {
 
   contactBulkDepth(_a, _b, _collision, depth) { return depth; }
 
+  contactBulkMobility(_body, _other, mobility) { return mobility; }
+
   recordBodyContact() {}
+
 
   dampRestingContacts(dt) {
     // Constraint corrections otherwise recycle energy indefinitely in a pile.
     // Leave the hand, throws, landing squashes and intentional little hops free.
     const damping = Math.exp(-dt * 32);
     for (const body of this.bodies) {
+      if (body.dragPointer !== null && this.bodyDrags(body).length === 1
+        && body.contactBodyIds.size > 0 && (body.fusionProgress ?? 0) < .02
+        && body.floorCompression<.02 && !body.elasticShape && !body.pokeDeformation) {
+        // The grip is pinned directly; only residual material velocity is
+        // damped. Contact corrections must not pump free vertices forever.
+        for (const point of body.particles) {
+          point.px = point.x - (point.x - point.px) * damping;
+          point.py = point.y - (point.y - point.py) * damping;
+        }
+        continue;
+      }
       if (body.dragPointer !== null || (!body.isSupported && body.contactBodyIds.size === 0) || body.elasticShape
         || this.floorY - body.particles[0].y > body.height * 3.4
         || body.pokeDeformation || this.time - body.lastImpactAt < 0.6
@@ -1135,6 +1149,8 @@ export class SoftBodyWorld {
   }
 
   effectiveDragTarget(drag) {
+    if(drag.freezeResolvedTarget && drag.resolvedTargetStep===this.stepCount)
+      return drag.resolvedTarget;
     const body = drag.body, scales = floorScales(body);
     const axis = body.twoGripAxis ?? {x:1,y:0}, stretch = body.twoGripStretch;
     const scaleX = scales.x * Math.hypot(axis.x*stretch,axis.y/stretch);
@@ -1145,7 +1161,11 @@ export class SoftBodyWorld {
     const bottom = this.floorY-Math.max(6,drag.floorGripClearance*scaleY);
     const target = {x:clamp(drag.targetX-(drag.inputOffsetX??0),Math.min(left,right),Math.max(left,right)),
       y:clamp(drag.targetY-(drag.inputOffsetY??0),Math.min(top,bottom),Math.max(top,bottom))};
-    return this.constrainDragTarget(drag, target, gripOffset(drag));
+    const limits = { left: Math.min(left,right), right: Math.max(left,right),
+      top: Math.min(top,bottom), bottom: Math.max(top,bottom) };
+    drag.resolvedTarget = this.constrainDragTarget(drag, target, gripOffset(drag), limits);
+    drag.resolvedTargetStep=this.stepCount;
+    return drag.resolvedTarget;
   }
 
   constrainDragTarget(_drag, target) {
@@ -1155,10 +1175,16 @@ export class SoftBodyWorld {
   applyDragPose() {
     for (const drag of this.drags.values()) {
       if (this.bodyDrags(drag.body).length > 1) continue;
-      const movementLength = Math.hypot(drag.lastMoveX, drag.lastMoveY);
+      const blockedHand=drag.freezeResolvedTarget&&drag.body.contactBodyIds.size>0;
+      // Contact deformation and applyDragLag already follow the resolved
+      // movement. A far-ahead pointer must not add a fresh pose kick while
+      // the material grip is blocked by another mass.
+      const moveX=blockedHand?0:drag.lastMoveX;
+      const moveY=blockedHand?0:drag.lastMoveY;
+      const movementLength = Math.hypot(moveX, moveY);
       if (movementLength >= 0.2) {
-        const directionX = drag.lastMoveX / movementLength;
-        const directionY = drag.lastMoveY / movementLength;
+        const directionX = moveX / movementLength;
+        const directionY = moveY / movementLength;
         const maximumLag = Math.min(drag.body.height * 0.085, movementLength * 0.34);
         for (let index = 1; index < drag.body.particles.length; index += 1) {
           const upperWeight = clamp((-REST_RING[index - 1].y + 0.08) / 0.6, 0, 1);
@@ -1192,8 +1218,11 @@ export class SoftBodyWorld {
         drag.body.height * 0.45,
         this.floorY - drag.body.height * 0.26,
       );
-      const movementX = targetX - center.x;
-      const movementY = targetY - center.y;
+      // Move the mass by the hand's resolved displacement. The barycentric
+      // constraint below repairs material-point error; translating the whole
+      // mass for that same residual again creates a contact feedback loop.
+      const movementX = drag.freezeResolvedTarget?drag.resolvedMoveX:targetX-center.x;
+      const movementY = drag.freezeResolvedTarget?drag.resolvedMoveY:targetY-center.y;
       const movementLength = Math.hypot(movementX, movementY);
       if (movementLength < 0.2) continue;
       const lagDistance = Math.min(movementLength * 0.16, drag.body.height * 0.12);
@@ -1684,8 +1713,9 @@ export class SoftBodyWorld {
           const hintLength = Math.hypot(hintX, hintY);
           if (hintLength > EPSILON) preferred = { nx: hintX / hintLength, ny: hintY / hintLength };
         }
-        const collision = satCollision(a, b, verticalBias, preferred);
+        let collision = satCollision(a, b, verticalBias, preferred);
         if (!collision) continue;
+        collision=this.consistentContactCollision(a,b,collision,verticalBias);
         activePairs.add(pairKey);
         const stored = a.id < b.id
           ? { nx: collision.nx, ny: collision.ny }
@@ -1697,6 +1727,10 @@ export class SoftBodyWorld {
     for (const [pairKey, state] of this.contactNormals) {
       if (!activePairs.has(pairKey) && this.stepCount - state.seenAt > 2) this.contactNormals.delete(pairKey);
     }
+  }
+
+  consistentContactCollision(_bodyA,_bodyB,collision,_verticalBias) {
+    return collision;
   }
 
   solveSatContact(bodyA, bodyB, collision) {
@@ -1733,8 +1767,11 @@ export class SoftBodyWorld {
     // stacking soft while ensuring a held body cannot tunnel or reverse order.
     const bulkDepth = this.contactBulkDepth(bodyA, bodyB, collision,
       Math.max(0, collision.overlap - this.config.contactSkin * 2) * 0.22 * response);
-    translateBody(bodyA, -1, bulkDepth * mobilityA / totalMobility);
-    translateBody(bodyB, 1, bulkDepth * mobilityB / totalMobility);
+    const bulkMobilityA=this.contactBulkMobility(bodyA,bodyB,mobilityA);
+    const bulkMobilityB=this.contactBulkMobility(bodyB,bodyA,mobilityB);
+    const totalBulkMobility=bulkMobilityA+bulkMobilityB;
+    translateBody(bodyA, -1, bulkDepth * bulkMobilityA / totalBulkMobility);
+    translateBody(bodyB, 1, bulkDepth * bulkMobilityB / totalBulkMobility);
     const centerA = bodyA.particles[0];
     const centerB = bodyB.particles[0];
     const centerSeparation = (centerB.x - centerA.x) * collision.nx
@@ -1744,8 +1781,8 @@ export class SoftBodyWorld {
       + Math.abs(collision.ny) * (bodyA.height + bodyB.height)
     );
     const orderCorrection = Math.max(0, minimumCenterGap - centerSeparation) * response;
-    translateBody(bodyA, -1, orderCorrection * mobilityA / totalMobility);
-    translateBody(bodyB, 1, orderCorrection * mobilityB / totalMobility);
+    translateBody(bodyA, -1, orderCorrection * bulkMobilityA / totalBulkMobility);
+    translateBody(bodyB, 1, orderCorrection * bulkMobilityB / totalBulkMobility);
 
     const moveContacts = (contacts, direction, amount) => {
       for (const point of contacts) {

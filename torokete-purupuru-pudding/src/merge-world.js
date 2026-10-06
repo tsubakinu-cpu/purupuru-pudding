@@ -1,4 +1,4 @@
-import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261006-contact4";
+import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261006-smooth7";
 
 export const PUDDING_COLORS = Object.freeze([
   Object.freeze({ id: "custard", name: "カスタード", tint: "#ffd768", accent: "#fff2a6" }),
@@ -274,59 +274,200 @@ export class MergePuddingWorld extends SoftBodyWorld {
     return this.time >= a.noMergeUntil && this.time >= b.noMergeUntil;
   }
 
-  constrainDragTarget(drag, target, gripOffset) {
-    let x = target.x;
-    let y = target.y;
+  consistentContactCollision(a,b,collision,verticalBias) {
+    if(this.pairCanFuse(a,b))return collision;
+    for(const [held,other,sign]of[[a,b,1],[b,a,-1]]) {
+      const drags=this.bodyDrags(held);
+      if(drags.length!==1)continue;
+      const drag=drags[0];
+      if(drag.contactGuardStep!==this.stepCount)continue;
+      const reference=drag.orderConstraints?.find(c=>c.bodyId===other.id&&c.activeThisStep);
+      // The swept hand guard and SAT must share one side of the contact.
+      // Otherwise a recently retired SAT normal can push the neighbor the
+      // opposite way while the hand guard follows it backwards at every step.
+      if(reference && (collision.nx*reference.nx+collision.ny*reference.ny)*sign<-.1) {
+        const normal={nx:reference.nx*sign,ny:reference.ny*sign};
+        return physicsMath.satCollision(a,b,verticalBias,normal)??collision;
+      }
+    }
+    return collision;
+  }
+
+  constrainDragTarget(drag, target, gripOffset, limits) {
+    const center = drag.body.particles[0];
+    if(drag.motionStep!==this.stepCount) {
+      const inputDistance=Math.hypot(drag.targetX-(drag.resolvedRawX??drag.startX),
+        drag.targetY-(drag.resolvedRawY??drag.startY));
+      drag.motionStep=this.stepCount;drag.resolvedRawX=drag.targetX;drag.resolvedRawY=drag.targetY;
+      drag.motionTarget=drag.lastJointTarget??{x:center.x+gripOffset.x,y:center.y+gripOffset.y};
+      drag.motionTarget={x:clamp(drag.motionTarget.x,limits.left,limits.right),
+        y:clamp(drag.motionTarget.y,limits.top,limits.bottom)};
+      const contact=(drag.orderConstraints??[]).some(c=>c.contactSeen)
+        || drag.body.floorCompression>.02;
+      const budget=inputDistance+(contact?drag.pendingInputReach??0:0);
+      drag.circularMotion=contact&&budget+2>drag.body.width*.28;
+      drag.motionReach=contact?Math.min(budget+2,drag.body.width*.28):budget+2;
+      // Distribute a batched input over physics steps without accumulating
+      // pressure behind a blocked reference. Unused input budget expires as
+      // it is offered to the solver, even if contacts prevent movement.
+      drag.pendingInputReach=contact?Math.max(0,budget-drag.motionReach+2):0;
+    }
+    const range={left:Math.max(limits.left,drag.motionTarget.x-drag.motionReach),
+      right:Math.min(limits.right,drag.motionTarget.x+drag.motionReach),
+      top:Math.max(limits.top,drag.motionTarget.y-drag.motionReach),
+      bottom:Math.min(limits.bottom,drag.motionTarget.y+drag.motionReach)};
+    // Bounds take precedence after a resize or a strongly changed floor pose.
+    if(range.left>range.right){range.left=limits.left;range.right=limits.right;}
+    if(range.top>range.bottom){range.top=limits.top;range.bottom=limits.bottom;}
+    const anchor = { x: clamp(center.x + gripOffset.x, range.left, range.right),
+      y: clamp(center.y + gripOffset.y, range.top, range.bottom) };
+    if(drag.circularMotion) {
+      const dx=anchor.x-drag.motionTarget.x,dy=anchor.y-drag.motionTarget.y,length=Math.hypot(dx,dy);
+      if(length>drag.motionReach){anchor.x=drag.motionTarget.x+dx*drag.motionReach/length;
+        anchor.y=drag.motionTarget.y+dy*drag.motionReach/length;}
+    }
+    const desired = { x: target.x - gripOffset.x, y: target.y - gripOffset.y };
+    const reachable={x:clamp(target.x,range.left,range.right),
+      y:clamp(target.y,range.top,range.bottom)};
+    if(drag.circularMotion) {
+      const x=reachable.x-drag.motionTarget.x,y=reachable.y-drag.motionTarget.y,length=Math.hypot(x,y);
+      if(length>drag.motionReach){reachable.x=drag.motionTarget.x+x*drag.motionReach/length;
+        reachable.y=drag.motionTarget.y+y*drag.motionReach/length;}
+    }
+    const dx = reachable.x-gripOffset.x-center.x, dy = reachable.y-gripOffset.y-center.y;
+    const planes = [
+      { nx: 1, ny: 0, limit: range.right }, { nx: -1, ny: 0, limit: -range.left },
+      { nx: 0, ny: 1, limit: range.bottom }, { nx: 0, ny: -1, limit: -range.top },
+    ];
+    // Broad phase and swept checks run once, on one geometry snapshot. The old
+    // per-iteration half-plane sweep could re-anchor twelve times in a step.
+    const at = fraction => ({ particles: drag.body.particles.map(p =>
+      ({ x: p.x + dx * fraction, y: p.y + dy * fraction })) });
+    const prepare = drag.contactGuardStep !== this.stepCount;
+    drag.contactGuardStep = this.stepCount;
+    let hasContact=drag.body.floorCompression>.02,hasFusionContact=false;
     for (const constraint of drag.orderConstraints ?? []) {
       const other = this.getBody(constraint.bodyId);
       if (!other) continue;
-      const desiredCenterX = x - gripOffset.x;
-      const desiredCenterY = y - gripOffset.y;
-      const center=drag.body.particles[0],otherCenter=other.particles[0];
-      const dx=desiredCenterX-center.x,dy=desiredCenterY-center.y;
-      const t=clamp(((otherCenter.x-center.x)*dx+(otherCenter.y-center.y)*dy)/Math.max(.001,dx*dx+dy*dy),0,1);
-      const at=fraction=>({...drag.body,particles:drag.body.particles.map(p=>({x:p.x+dx*fraction,y:p.y+dy*fraction}))});
-      constraint.contactSeen ||= this.contactNormals.has(pairKey(drag.body,other));
-      const tangentialMove=Math.abs((desiredCenterX-constraint.pointerAnchorX)*-constraint.ny
-        +(desiredCenterY-constraint.pointerAnchorY)*constraint.nx);
-      const clearance=.52*(Math.abs(constraint.ny)*(drag.body.width+other.width)
-        +Math.abs(constraint.nx)*(drag.body.height+other.height));
-      // The previous infinite half-plane also blocked gestures far above the
-      // pudding. Only retain its no-crossing guard along a real blocked path.
-      if ((!constraint.contactSeen || tangentialMove>clearance)
-        && !physicsMath.satCollision(at(1),other) && !physicsMath.satCollision(at(t),other)) {
-        const nx=otherCenter.x-desiredCenterX,ny=otherCenter.y-desiredCenterY,length=Math.max(.001,Math.hypot(nx,ny));
-        constraint.nx=nx/length;constraint.ny=ny/length;
-        constraint.pointerAnchorX=desiredCenterX;constraint.pointerAnchorY=desiredCenterY;
-        constraint.contactSeen=false;
-        drag.collisionAnchorX=center.x;drag.collisionAnchorY=center.y;
-        this.contactNormals.delete(pairKey(drag.body,other));
-        continue;
+      const oc = other.particles[0];
+      if (prepare) {
+        const t = clamp(((oc.x-center.x)*dx+(oc.y-center.y)*dy)
+          / Math.max(.001,dx*dx+dy*dy),0,1);
+        const blocked = physicsMath.satCollision(at(1),other,1,null,2)
+          || (t > .001 && physicsMath.satCollision(at(t),other,1,null,2));
+        if (!blocked) {
+          // Update from the actual mass, never the far-ahead pointer. Contact
+          // normals remain fixed through this step's position iterations.
+          const nx=oc.x-center.x, ny=oc.y-center.y, length=Math.max(.001,Math.hypot(nx,ny));
+          constraint.nx=nx/length; constraint.ny=ny/length;
+          constraint.pointerAnchorX=center.x; constraint.pointerAnchorY=center.y;
+          constraint.contactSeen=false;
+          constraint.activeThisStep=false;
+          drag.collisionAnchorX=center.x; drag.collisionAnchorY=center.y;
+          continue;
+        }
+        const wasActive=constraint.activeThisStep;
+        constraint.contactSeen=true;
+        constraint.activeThisStep=true;
+        const support=(body,nx,ny)=>Math.max(...body.particles.slice(1).map(p=>
+          (p.x-body.particles[0].x)*nx+(p.y-body.particles[0].y)*ny));
+        const supportGap=.5*(support(drag.body,constraint.nx,constraint.ny)
+          +support(other,-constraint.nx,-constraint.ny));
+        constraint.supportGap=wasActive?constraint.supportGap+(supportGap-constraint.supportGap)*.15:supportGap;
       }
-      const separation = (otherCenter.x - desiredCenterX) * constraint.nx
-        + (otherCenter.y - desiredCenterY) * constraint.ny;
+      if(!constraint.activeThisStep)continue;
+      const key=pairKey(drag.body,other);
       const compatible=this.pairCanFuse(drag.body,other);
+      hasContact=true;hasFusionContact ||=compatible;
       const scale=compatible?Math.min(drag.body.fusionPose?.normalScale??1,other.fusionPose?.normalScale??1):1;
-      const minimumGap = (compatible?.435:.34)*scale * (
-        Math.abs(constraint.nx) * (drag.body.width + other.width)
-        + Math.abs(constraint.ny) * (drag.body.height + other.height)
-      );
-      if (separation >= minimumGap) continue;
-      const correction = minimumGap - separation;
-      // This is only proof of a deliberate hand load, not merge pressure.
-      // A passive grab on an already squashed stack must not start a merge.
+      const minimumGap=compatible?.435*scale*(
+        Math.abs(constraint.nx)*(drag.body.width+other.width)
+        +Math.abs(constraint.ny)*(drag.body.height+other.height)):constraint.supportGap;
+      const separation=(oc.x-desired.x)*constraint.nx+(oc.y-desired.y)*constraint.ny;
+      const correction=minimumGap-separation;
       const travel=(drag.targetX-drag.startX)*constraint.nx+(drag.targetY-drag.startY)*constraint.ny;
       if(travel>MERGE_RULES.minimumHandPress && correction>MERGE_RULES.minimumHandPress) {
-        const key=pairKey(drag.body,other),sign=drag.body.id<other.id?1:-1;
+        const sign=drag.body.id<other.id?1:-1;
         const previous=this.handContactLoads.get(key);
-        if(!previous || previous.load<correction) this.handContactLoads.set(key,{
-          nx:constraint.nx*sign,ny:constraint.ny*sign,load:correction,
-        });
+        if(!previous||previous.load<correction)
+          this.handContactLoads.set(key,{nx:constraint.nx*sign,ny:constraint.ny*sign,load:correction});
       }
-      x -= constraint.nx * correction;
-      y -= constraint.ny * correction;
+      // A crowded floor can make nominal center gaps mutually impossible.
+      // Preserve the existing separation in that case, allowing SAT to push
+      // the other mass softly instead of sending this grip below the floor.
+      const existing=(oc.x-anchor.x+gripOffset.x)*constraint.nx
+        +(oc.y-anchor.y+gripOffset.y)*constraint.ny;
+      const nominalGap=travel>MERGE_RULES.minimumHandPress?minimumGap:Math.min(minimumGap,existing);
+      // A compressed neighbor may spread or settle while the hand is off the
+      // floor too. Do not move the hand backwards just to restore its nominal
+      // support radius. SAT preserves positive order and resolves the actual
+      // soft contact; intentional fusion keeps its original pressure gap.
+      const orderGap=.18*(Math.abs(constraint.nx)*(drag.body.width+other.width)
+        +Math.abs(constraint.ny)*(drag.body.height+other.height));
+      const referenceSeparation=(oc.x-drag.motionTarget.x+gripOffset.x)*constraint.nx
+        +(oc.y-drag.motionTarget.y+gripOffset.y)*constraint.ny;
+      const gap=compatible?nominalGap:Math.max(orderGap,
+        Math.min(nominalGap,existing,referenceSeparation));
+      planes.push({nx:constraint.nx,ny:constraint.ny,
+        limit:oc.x*constraint.nx+oc.y*constraint.ny-gap
+          +gripOffset.x*constraint.nx+gripOffset.y*constraint.ny,
+        relaxedLimit:oc.x*constraint.nx+oc.y*constraint.ny-Math.min(gap,existing)
+          +gripOffset.x*constraint.nx+gripOffset.y*constraint.ny});
     }
-    return { x, y };
+    // Closest point in the joint convex feasible region: order-independent,
+    // bounded, and anchored by a known feasible point in compressed stacks.
+    const radius=drag.motionReach,origin=drag.motionTarget;
+    // Pressure still uses the raw goal above. The positional projection uses
+    // this step's reachable goal: a far-ahead finger must not buy a few pixels
+    // of horizontal travel by pulling the hand far along a slanted contact.
+    const aim=reachable;
+    const inMotionRange=p=>!drag.circularMotion
+      ||(p.x-origin.x)**2+(p.y-origin.y)**2<=radius*radius+1e-6;
+    const feasible=p=>inMotionRange(p)&&planes.every(h=>p.x*h.nx+p.y*h.ny<=h.limit+1e-6);
+    const finish=p=>{
+      if(drag.resolvedMotionStep!==this.stepCount) {
+        const previous=drag.lastJointTarget??p;
+        drag.resolvedMoveX=p.x-previous.x;drag.resolvedMoveY=p.y-previous.y;
+        drag.resolvedMotionStep=this.stepCount;
+      }
+      drag.lastJointTarget={...p};
+      // A material hand anchor is fixed during the position solve. Fusion
+      // alone needs the updated opposing mass to remain pressure-driven.
+      drag.freezeResolvedTarget=hasContact&&!hasFusionContact;
+      return p;
+    };
+    let best=null, distance=Infinity;
+    const consider=p=>{if(!feasible(p))return;const d=(p.x-aim.x)**2+(p.y-aim.y)**2;
+      if(d<distance){best=p;distance=d;}};
+    for(let pass=0;pass<2;pass++) {
+      consider(aim); consider(anchor);
+      if(drag.circularMotion) {
+        const dx=aim.x-origin.x,dy=aim.y-origin.y,length=Math.hypot(dx,dy);
+        if(length>radius)consider({x:origin.x+dx*radius/length,y:origin.y+dy*radius/length});
+      }
+      if(distance<1e-12)return finish(best);
+      for(let i=0;i<planes.length;i++) {
+        const a=planes[i], amount=aim.x*a.nx+aim.y*a.ny-a.limit;
+        consider({x:aim.x-a.nx*amount,y:aim.y-a.ny*amount});
+        if(drag.circularMotion) {
+          const signed=origin.x*a.nx+origin.y*a.ny-a.limit;
+          if(Math.abs(signed)<=radius) {
+            const span=Math.sqrt(Math.max(0,radius*radius-signed*signed));
+            const x=origin.x-a.nx*signed,y=origin.y-a.ny*signed;
+            consider({x:x-a.ny*span,y:y+a.nx*span});
+            consider({x:x+a.ny*span,y:y-a.nx*span});
+          }
+        }
+        for(let j=0;j<i;j++) {
+          const b=planes[j], det=a.nx*b.ny-a.ny*b.nx;
+          if(Math.abs(det)<1e-8)continue;
+          consider({x:(a.limit*b.ny-a.ny*b.limit)/det,y:(a.nx*b.limit-a.limit*b.nx)/det});
+        }
+      }
+      if(best)return finish(best);
+      for(const plane of planes)plane.limit=plane.relaxedLimit??plane.limit;
+    }
+    return finish(anchor);
   }
 
   step(dt = 1 / 60) {
@@ -822,6 +963,15 @@ export class MergePuddingWorld extends SoftBodyWorld {
     // Intention changes the material rest shape, never its opacity or solidity.
     return 1;
   }
+
+  contactBulkMobility(body,other,mobility) {
+    // A hand resists whole-mass pushback; the contact patch stays soft.
+    // Intentional fusion keeps its original mass response.
+    return this.bodyDrags(body).length===1
+      && !this.pairCanFuse(body,other)?Math.min(mobility,.02):mobility;
+  }
+
+
 
   solveAdditionalShape(body) {
     const pose=body.fusionPose;
