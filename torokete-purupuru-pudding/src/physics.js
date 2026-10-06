@@ -149,7 +149,7 @@ function projectPolygon(points, axisX, axisY) {
   return { min, max };
 }
 
-function satCollision(bodyA, bodyB, verticalBias = 1, preferredNormal = null) {
+function satCollision(bodyA, bodyB, verticalBias = 1, preferredNormal = null, contactSkin = 0) {
   const polygonA = bodyRing(bodyA);
   const polygonB = bodyRing(bodyB);
   let bestOverlap = Infinity;
@@ -168,7 +168,7 @@ function satCollision(bodyA, bodyB, verticalBias = 1, preferredNormal = null) {
       const projectionA = projectPolygon(polygonA, axisX, axisY);
       const projectionB = projectPolygon(polygonB, axisX, axisY);
       const overlap = Math.min(projectionA.max, projectionB.max) - Math.max(projectionA.min, projectionB.min);
-      if (overlap <= 0) return null;
+      if (overlap <= -contactSkin) return null;
       if (overlap < bestOverlap) {
         bestOverlap = overlap;
         bestAxisX = axisX;
@@ -451,7 +451,7 @@ function solveDistanceConstraint(body, constraint) {
   b.y -= moveBY;
 }
 
-function solveAreaConstraint(body) {
+function solveAreaConstraint(body, stiffness = 0.085) {
   const ring = bodyRing(body);
   const currentArea = polygonArea(ring);
   const fusionArea=body.fusionPose?body.fusionPose.normalScale*body.fusionPose.transverseScale:1;
@@ -473,7 +473,7 @@ function solveAreaConstraint(body) {
   }
   if (denominator < EPSILON) return;
 
-  const lambda = clamp((difference / denominator) * 0.085, -0.035, 0.035);
+  const lambda = clamp((difference / denominator) * stiffness, -0.035, 0.035);
   for (let index = 0; index < ring.length; index += 1) {
     const point = ring[index];
     const gradient = gradients[index];
@@ -985,7 +985,7 @@ export class SoftBodyWorld {
       this.applyDragTargets();
       for (const body of this.bodies) {
         for (const constraint of body.constraints) solveDistanceConstraint(body, constraint);
-        solveAreaConstraint(body);
+        solveAreaConstraint(body, this.areaConstraintStrength(body));
         this.solveGestureStretch(body);
         this.solvePokeDeformation(body);
         this.solveTransientShape(body);
@@ -1033,6 +1033,12 @@ export class SoftBodyWorld {
   }
 
   solveAdditionalShape() {}
+
+  areaConstraintStrength() { return 0.085; }
+
+  contactBulkDepth(_a, _b, _collision, depth) { return depth; }
+
+  recordBodyContact() {}
 
   dampRestingContacts(dt) {
     // Constraint corrections otherwise recycle energy indefinitely in a pile.
@@ -1308,8 +1314,8 @@ export class SoftBodyWorld {
     }
   }
 
-  posedOffsets(body) {
-    const axes=body.twoGripRestAxes ?? body.floorAxes ?? normalizedBodyAxes(body),scales=floorScales(body);
+  posedOffsets(body, axesOverride = null) {
+    const axes=axesOverride ?? body.twoGripRestAxes ?? body.floorAxes ?? normalizedBodyAxes(body),scales=floorScales(body);
     return [{x:0,y:0},...REST_RING.map(rest=>{
       const v=twoGripVector(body,axes.ux*rest.x*body.width+axes.vx*rest.y*body.height,
         axes.uy*rest.x*body.width+axes.vy*rest.y*body.height);
@@ -1725,7 +1731,8 @@ export class SoftBodyWorld {
     // Move a little of the whole mass as well as deforming the contact patch.
     // The centre-gap guard only engages under deep penetration, leaving normal
     // stacking soft while ensuring a held body cannot tunnel or reverse order.
-    const bulkDepth = Math.max(0, collision.overlap - this.config.contactSkin * 2) * 0.22 * response;
+    const bulkDepth = this.contactBulkDepth(bodyA, bodyB, collision,
+      Math.max(0, collision.overlap - this.config.contactSkin * 2) * 0.22 * response);
     translateBody(bodyA, -1, bulkDepth * mobilityA / totalMobility);
     translateBody(bodyB, 1, bulkDepth * mobilityB / totalMobility);
     const centerA = bodyA.particles[0];
@@ -1757,6 +1764,7 @@ export class SoftBodyWorld {
     };
     moveContacts(contactsA, -1, moveA);
     moveContacts(contactsB, 1, moveB);
+    this.recordBodyContact(bodyA, bodyB, collision, contactsA, contactsB);
     bodyA.contactBodyIds.add(bodyB.id);
     bodyB.contactBodyIds.add(bodyA.id);
     bodyA.contactCount += contactsA.length;

@@ -1,7 +1,7 @@
 import { PUDDING_SPRITE } from "./assets.js";
-import { REST_RING, physicsMath } from "./physics.js?v=20261006-touch3";
+import { REST_RING, physicsMath } from "./physics.js?v=20261006-contact4";
 import { FaceRig } from "./face.js";
-import { PUDDING_COLORS } from "./merge-world.js?v=20261006-touch3";
+import { PUDDING_COLORS } from "./merge-world.js?v=20261006-contact4";
 
 const PLACEHOLDER_COLORS = [
   ["#ffe69b", "#e8a866", "#8a4d32"],

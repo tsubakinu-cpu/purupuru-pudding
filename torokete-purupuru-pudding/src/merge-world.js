@@ -1,4 +1,4 @@
-import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261006-touch3";
+import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261006-contact4";
 
 export const PUDDING_COLORS = Object.freeze([
   Object.freeze({ id: "custard", name: "カスタード", tint: "#ffd768", accent: "#fff2a6" }),
@@ -15,6 +15,8 @@ export const PUDDING_TIERS = Object.freeze([
 export const MERGE_RULES = Object.freeze({
   holdDuration: 0.48,
   deepPressThreshold: 0.28,
+  minimumHandPress: 6,
+  contactCompressionScale: 0.18,
   releaseRecovery: 0.16,
   splitStretch: 1.43,
   splitHoldDuration: 0.22,
@@ -90,6 +92,9 @@ export class MergePuddingWorld extends SoftBodyWorld {
     super({ ...options, maxBodies: hardMaxBodies });
     this.addLimit = clamp(options.addLimit ?? Math.min(12, hardMaxBodies), 1, hardMaxBodies);
     this.fusionPairs = new Map();
+    this.handContactLoads = new Map();
+    this.handContactSamples = new Map();
+    this.contactRestOffsets = new Map();
     this.sparkles = [];
     this.nextRenderOrder = 1;
     this.addColorCursor = 0;
@@ -176,6 +181,9 @@ export class MergePuddingWorld extends SoftBodyWorld {
   removeAll() {
     super.removeAll();
     this.fusionPairs?.clear();
+    this.handContactLoads?.clear();
+    this.handContactSamples?.clear();
+    this.contactRestOffsets?.clear();
     if (this.sparkles) this.sparkles.length = 0;
     this.goal = null;
     this.goalQueue = [];
@@ -278,16 +286,19 @@ export class MergePuddingWorld extends SoftBodyWorld {
       const dx=desiredCenterX-center.x,dy=desiredCenterY-center.y;
       const t=clamp(((otherCenter.x-center.x)*dx+(otherCenter.y-center.y)*dy)/Math.max(.001,dx*dx+dy*dy),0,1);
       const at=fraction=>({...drag.body,particles:drag.body.particles.map(p=>({x:p.x+dx*fraction,y:p.y+dy*fraction}))});
-      // The previous infinite half-plane also blocked gestures far above the
-      // pudding. Only retain its no-crossing guard along a real blocked path.
+      constraint.contactSeen ||= this.contactNormals.has(pairKey(drag.body,other));
       const tangentialMove=Math.abs((desiredCenterX-constraint.pointerAnchorX)*-constraint.ny
         +(desiredCenterY-constraint.pointerAnchorY)*constraint.nx);
       const clearance=.52*(Math.abs(constraint.ny)*(drag.body.width+other.width)
         +Math.abs(constraint.nx)*(drag.body.height+other.height));
-      if (tangentialMove>clearance && !physicsMath.satCollision(at(1),other) && !physicsMath.satCollision(at(t),other)) {
+      // The previous infinite half-plane also blocked gestures far above the
+      // pudding. Only retain its no-crossing guard along a real blocked path.
+      if ((!constraint.contactSeen || tangentialMove>clearance)
+        && !physicsMath.satCollision(at(1),other) && !physicsMath.satCollision(at(t),other)) {
         const nx=otherCenter.x-desiredCenterX,ny=otherCenter.y-desiredCenterY,length=Math.max(.001,Math.hypot(nx,ny));
         constraint.nx=nx/length;constraint.ny=ny/length;
         constraint.pointerAnchorX=desiredCenterX;constraint.pointerAnchorY=desiredCenterY;
+        constraint.contactSeen=false;
         drag.collisionAnchorX=center.x;drag.collisionAnchorY=center.y;
         this.contactNormals.delete(pairKey(drag.body,other));
         continue;
@@ -296,12 +307,22 @@ export class MergePuddingWorld extends SoftBodyWorld {
         + (otherCenter.y - desiredCenterY) * constraint.ny;
       const compatible=this.pairCanFuse(drag.body,other);
       const scale=compatible?Math.min(drag.body.fusionPose?.normalScale??1,other.fusionPose?.normalScale??1):1;
-      const minimumGap = (compatible?.49:.2)*scale * (
+      const minimumGap = (compatible?.435:.34)*scale * (
         Math.abs(constraint.nx) * (drag.body.width + other.width)
         + Math.abs(constraint.ny) * (drag.body.height + other.height)
       );
       if (separation >= minimumGap) continue;
       const correction = minimumGap - separation;
+      // This is only proof of a deliberate hand load, not merge pressure.
+      // A passive grab on an already squashed stack must not start a merge.
+      const travel=(drag.targetX-drag.startX)*constraint.nx+(drag.targetY-drag.startY)*constraint.ny;
+      if(travel>MERGE_RULES.minimumHandPress && correction>MERGE_RULES.minimumHandPress) {
+        const key=pairKey(drag.body,other),sign=drag.body.id<other.id?1:-1;
+        const previous=this.handContactLoads.get(key);
+        if(!previous || previous.load<correction) this.handContactLoads.set(key,{
+          nx:constraint.nx*sign,ny:constraint.ny*sign,load:correction,
+        });
+      }
       x -= constraint.nx * correction;
       y -= constraint.ny * correction;
     }
@@ -323,6 +344,9 @@ export class MergePuddingWorld extends SoftBodyWorld {
     }
     const before = this.time;
     const eventStart = this.events.length;
+    this.handContactLoads.clear();
+    this.handContactSamples.clear();
+    this.contactRestOffsets.clear();
     super.step(dt);
     const elapsed = this.time - before;
     if (elapsed <= 0) return;
@@ -727,22 +751,71 @@ export class MergePuddingWorld extends SoftBodyWorld {
     };
   }
 
+  materialContactOffsets(body) {
+    if(this.contactRestOffsets.has(body.id))return this.contactRestOffsets.get(body.id);
+    const pose=body.fusionPose;
+    const offsets=this.posedOffsets(body,pose?.axes);
+    if(pose)for(const offset of offsets) {
+      const normal=offset.x*pose.nx+offset.y*pose.ny;
+      const tx=offset.x-pose.nx*normal,ty=offset.y-pose.ny*normal;
+      offset.x=pose.nx*normal*pose.normalScale+tx*pose.transverseScale;
+      offset.y=pose.ny*normal*pose.normalScale+ty*pose.transverseScale;
+    }
+    this.contactRestOffsets.set(body.id,offsets);
+    return offsets;
+  }
+
+  contactCompression(body,nx,ny,contacts) {
+    const rest=this.materialContactOffsets(body),center=body.particles[0];
+    const reach=Math.max(10,...rest.map(p=>p.x*nx+p.y*ny));
+    let compression=0,count=0;
+    for(const point of contacts) {
+      const index=body.particles.indexOf(point);
+      if(index<1)continue;
+      const expected=rest[index].x*nx+rest[index].y*ny;
+      if(expected<reach*.35)continue;
+      const actual=(point.x-center.x)*nx+(point.y-center.y)*ny;
+      compression+=Math.max(0,expected-actual)/reach;count++;
+    }
+    return count?compression/count:0;
+  }
+
+  recordBodyContact(a,b,collision,contactsA,contactsB) {
+    if(!this.handContactLoads.has(pairKey(a,b)) || !this.pairCanFuse(a,b))return;
+    // Sample actual contact-patch deformation. The nominal material pose
+    // includes the fusion animation, so that animation cannot feed itself.
+    this.materialContactOffsets(a);this.materialContactOffsets(b);
+    this.handContactSamples.set(pairKey(a,b),{
+      nx:collision.nx,ny:collision.ny,contactsA,contactsB,aId:a.id,
+    });
+  }
+
+  contactBulkDepth(a,b,collision,depth) {
+    if(!this.handContactLoads.has(pairKey(a,b)) || a.fusionProgress>.04 || b.fusionProgress>.04)return depth;
+    const reach=Math.max(30,Math.min(
+      Math.hypot(collision.nx*a.width,collision.ny*a.height),
+      Math.hypot(collision.nx*b.width,collision.ny*b.height)));
+    const yieldAmount=clamp((collision.overlap/reach-.08)/.18,0,1);
+    // Yield smoothly: first a soft dent, then more whole-mass displacement.
+    return depth+collision.overlap*(.10+.30*yieldAmount);
+  }
+
+  areaConstraintStrength(body) {
+    return this.bodyDrags(body).length===1 && body.contactBodyIds.size>0
+      && !body.fusionPose && body.floorCompression<.2 ? .23:.085;
+  }
+
   fusionPressure(a, b) {
-    const centerA = a.particles[0];
-    const centerB = b.particles[0];
-    const dx = centerB.x - centerA.x;
-    const dy = centerB.y - centerA.y;
-    const length = Math.max(0.001, Math.hypot(dx, dy));
-    const nx = dx / length;
-    const ny = dy / length;
-    const naturalReach = Math.max(20, Math.hypot(
-      nx * (a.width + b.width) * 0.46,
-      ny * (a.height + b.height) * 0.46,
-    ));
-    const desiredA = this.desiredCenter(a);
-    const desiredB = this.desiredCenter(b);
-    const desiredDistance = Math.hypot(desiredB.x - desiredA.x, desiredB.y - desiredA.y);
-    return clamp((naturalReach - desiredDistance) / (naturalReach * 0.38), 0, 1);
+    const key=pairKey(a,b),sample=this.handContactSamples.get(key),load=this.handContactLoads.get(key);
+    if(!sample || !load)return 0;
+    const sign=sample.aId===a.id?1:-1,nx=sample.nx*sign,ny=sample.ny*sign;
+    const loadSign=a.id<b.id?1:-1;
+    if((load.nx*nx+load.ny*ny)*loadSign<.5)return 0;
+    const contactsA=sign===1?sample.contactsA:sample.contactsB;
+    const contactsB=sign===1?sample.contactsB:sample.contactsA;
+    const compression=Math.max(this.contactCompression(a,nx,ny,contactsA),
+      this.contactCompression(b,-nx,-ny,contactsB));
+    return clamp(compression/MERGE_RULES.contactCompressionScale,0,1);
   }
 
   contactResponse(a, b) {
@@ -798,8 +871,9 @@ export class MergePuddingWorld extends SoftBodyWorld {
         const oneGripEachAtMost = dragsA.length <= 1 && dragsB.length <= 1;
         const handActive = dragsA.length + dragsB.length > 0;
         const unlocked = this.time >= a.noMergeUntil && this.time >= b.noMergeUntil;
-        const touching = a.contactBodyIds.has(b.id) || b.contactBodyIds.has(a.id)
-          || paddedOverlap(a, b, 7);
+        const sample=this.handContactSamples.get(key);
+        const preferred=sample?{nx:sample.nx*(sample.aId===a.id?1:-1),ny:sample.ny*(sample.aId===a.id?1:-1)}:null;
+        const touching = Boolean(sample && physicsMath.satCollision(a,b,1,preferred,1.5));
         const pressure = oneGripEachAtMost && handActive && unlocked && touching
           ? this.fusionPressure(a, b) : 0;
         state.pressure = pressure;
@@ -881,10 +955,13 @@ export class MergePuddingWorld extends SoftBodyWorld {
   removeBodies(bodies) {
     const removedIds = new Set(bodies.map((body) => body.id));
     this.bodies = this.bodies.filter((body) => !removedIds.has(body.id));
-    for (const key of [...this.fusionPairs.keys()]) {
-      const [aId, bId] = key.split(":").map(Number);
-      if (removedIds.has(aId) || removedIds.has(bId)) this.fusionPairs.delete(key);
+    for (const map of [this.fusionPairs,this.handContactLoads,this.handContactSamples]) {
+      for (const key of [...map.keys()]) {
+        const [aId, bId] = key.split(":").map(Number);
+        if (removedIds.has(aId) || removedIds.has(bId))map.delete(key);
+      }
     }
+    for(const id of removedIds)this.contactRestOffsets.delete(id);
   }
 
   fuseBodies(a, b) {
