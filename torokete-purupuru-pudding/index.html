@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#fff3dd">
+    <meta name="color-scheme" content="light">
+    <link rel="icon" href="data:,">
+    <title>とろけて！ぷるぷるプリン</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main id="game" class="game-shell">
+      <canvas
+        id="playfield"
+        tabindex="0"
+        role="application"
+        aria-label="ぷりんをつかみ、同じ色と大きさ同士を深く押し合わせて育てる、やわらかな遊び場"
+      ></canvas>
+
+      <header class="title-chip" aria-hidden="true">
+        <span class="title-chip__eyebrow">とけあい・わかれあい</span>
+        <h1>とろけて！<br>ぷるぷるプリン</h1>
+      </header>
+
+      <p id="art-status" class="art-status" hidden>確認用の形で表示中</p>
+
+      <aside id="goal-card" class="goal-card" aria-label="この子をつくろう">
+        <div class="goal-card__heading">
+          <span>この子をつくろう</span>
+          <time id="timer-chip" class="timer-chip" hidden>2:00</time>
+          <strong id="combo-badge" class="combo-badge" hidden></strong>
+        </div>
+        <div class="goal-queue">
+          <article class="goal-item goal-item--current" data-goal-index="0">
+            <span class="goal-item__turn">いま</span>
+            <span class="goal-sample-wrap">
+              <span class="goal-sample" data-tier="0">
+                <span class="goal-cream" aria-hidden="true"></span>
+                <span class="goal-cherry" aria-hidden="true"></span>
+              </span>
+            </span>
+            <span class="goal-item__name"></span>
+          </article>
+          <article class="goal-item" data-goal-index="1">
+            <span class="goal-item__turn">つぎ</span>
+            <span class="goal-sample-wrap">
+              <span class="goal-sample" data-tier="0">
+                <span class="goal-cream" aria-hidden="true"></span>
+                <span class="goal-cherry" aria-hidden="true"></span>
+              </span>
+            </span>
+            <span class="goal-item__name"></span>
+          </article>
+          <article class="goal-item" data-goal-index="2">
+            <span class="goal-item__turn">そのつぎ</span>
+            <span class="goal-sample-wrap">
+              <span class="goal-sample" data-tier="0">
+                <span class="goal-cream" aria-hidden="true"></span>
+                <span class="goal-cherry" aria-hidden="true"></span>
+              </span>
+            </span>
+            <span class="goal-item__name"></span>
+          </article>
+        </div>
+      </aside>
+
+      <section class="play-hint" aria-label="遊び方">
+        <p><strong>同じ色・同じ大きさ</strong>を、手でむにーっと深く押し合わせる</p>
+        <p>大きい子は二本指で引っぱると分裂<span class="desktop-only">（PCは Shift＋クリック）</span></p>
+      </section>
+
+      <section id="control-dock" class="control-dock" aria-label="ゲーム操作">
+        <div class="color-picker" role="group" aria-label="追加する色">
+          <span class="color-picker__label">つぎに落ちる子</span>
+          <span id="next-color-preview" class="next-color-preview" aria-hidden="true"></span>
+          <strong id="next-color-name" class="next-color-name">カスタード</strong>
+        </div>
+
+        <nav id="controls" class="controls" aria-label="ゲーム操作ボタン">
+          <button id="add-button" class="control-button control-button--primary" type="button">
+            <span aria-hidden="true">＋</span>
+            ぷりん追加
+          </button>
+          <button id="reset-button" class="control-button" type="button">やり直す</button>
+          <button id="mode-button" class="control-button control-button--mode" type="button">⏱ 2分</button>
+          <button id="sound-button" class="control-button control-button--sound" type="button" aria-pressed="false">
+            🔈 OFF
+          </button>
+        </nav>
+      </section>
+
+      <section id="time-result" class="time-result" role="dialog" aria-modal="true" aria-labelledby="time-result-title" hidden>
+        <div class="time-result__card">
+          <p class="time-result__eyebrow">2分チャレンジ</p>
+          <h2 id="time-result-title">おつかれさま！</h2>
+          <div class="time-result__numbers">
+            <p><strong id="result-delivered">0</strong><span>とどけた子</span></p>
+            <p><strong id="result-combo">0</strong><span>最高コンボ</span></p>
+          </div>
+          <div class="time-result__actions">
+            <button id="retry-timed-button" class="control-button control-button--primary" type="button">もう一度 2分</button>
+            <button id="unlimited-button" class="control-button" type="button">時間なしで遊ぶ</button>
+          </div>
+        </div>
+      </section>
+
+      <p id="status" class="sr-only" role="status" aria-live="polite"></p>
+    </main>
+    <noscript>この遊びを動かすには JavaScript を有効にしてください。</noscript>
+    <script type="module" src="./src/game.js"></script>
+  </body>
+</html>
