@@ -7,7 +7,7 @@
     <meta name="color-scheme" content="light">
     <link rel="icon" href="data:,">
     <title>とろけて！ぷるぷるプリン</title>
-    <link rel="stylesheet" href="./styles.css?v=20261006-smooth7">
+    <link rel="stylesheet" href="./styles.css?v=20261007-play-modes1">
   </head>
   <body>
     <main id="game" class="game-shell">
@@ -25,7 +25,7 @@
 
       <p id="art-status" class="art-status" hidden>確認用の形で表示中</p>
 
-      <aside id="goal-card" class="goal-card" aria-label="この子をつくろう">
+      <aside id="goal-card" class="goal-card" aria-label="この子をつくろう" hidden>
         <div class="goal-card__heading">
           <span>この子をつくろう</span>
           <time id="timer-chip" class="timer-chip" hidden>2:00</time>
@@ -72,7 +72,7 @@
 
       <section id="control-dock" class="control-dock" aria-label="ゲーム操作">
         <div class="color-picker" role="group" aria-label="追加する色">
-          <span class="color-picker__label">つぎに落ちる子</span>
+          <span id="mode-label" class="mode-label">もちもち</span><span class="color-picker__label">つぎの子</span>
           <span id="next-color-preview" class="next-color-preview" aria-hidden="true"></span>
           <strong id="next-color-name" class="next-color-name">カスタード</strong>
         </div>
@@ -83,7 +83,7 @@
             ぷりん追加
           </button>
           <button id="reset-button" class="control-button" type="button">やり直す</button>
-          <button id="mode-button" class="control-button control-button--mode" type="button">⏱ 2分</button>
+          <button id="mode-button" class="control-button control-button--mode" type="button" aria-haspopup="dialog" aria-controls="mode-picker" aria-expanded="false">遊びを選ぶ</button>
           <button id="sound-button" class="control-button control-button--sound" type="button" aria-pressed="false">
             🔈 OFF
           </button>
@@ -105,9 +105,19 @@
         </div>
       </section>
 
+      <section id="mode-picker" class="mode-picker" role="dialog" aria-modal="true" aria-labelledby="modes-title" hidden>
+        <div class="mode-picker__card">
+          <div class="mode-picker__heading"><h2 id="modes-title">きょうは、どんなぷるぷる？</h2><button id="close-modes" type="button" aria-label="遊びに戻る">×</button></div>
+          <button class="mode-choice" type="button" data-mode="free"><span>もちもち</span><small>同じ大きさをくっつけて、育てて、分けて。時間なし。</small></button>
+          <button class="mode-choice" type="button" data-mode="mochi"><span>びよーん</span><small>ひとつの塊にとけあって、片側を持ち上げて伸ばそう。</small></button>
+          <button class="mode-choice" type="button" data-mode="goals"><span>この子をつくろう</span><small>3色のぷりんで、お題の子を順番につくろう。時間なし。</small></button>
+          <button class="mode-choice" type="button" data-mode="timed"><span>2分チャレンジ</span><small>3色のぷりんで、時間いっぱいお題に挑戦。</small></button>
+          <p class="mode-picker__note">遊びを変えても、ぷりんはそのまま待っているよ。</p>
+        </div>
+      </section>
       <p id="status" class="sr-only" role="status" aria-live="polite"></p>
     </main>
     <noscript>この遊びを動かすには JavaScript を有効にしてください。</noscript>
-    <script type="module" src="./src/game.js?v=20261006-smooth7"></script>
+    <script type="module" src="./src/game.js?v=20261007-play-modes1"></script>
   </body>
 </html>

@@ -1,4 +1,4 @@
-import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261006-smooth7";
+import { SoftBodyWorld, physicsMath, REST_RING } from "./physics.js?v=20261007-play-modes1";
 
 export const PUDDING_COLORS = Object.freeze([
   Object.freeze({ id: "custard", name: "カスタード", tint: "#ffd768", accent: "#fff2a6" }),

@@ -1,10 +1,12 @@
 import { loadOptionalImage } from "./assets.js";
 import { ToyAudio } from "./audio.js";
-import { MergePuddingWorld, PUDDING_COLORS, PUDDING_TIERS } from "./merge-world.js?v=20261006-smooth7";
-import { PuddingRenderer } from "./renderer.js?v=20261006-smooth7";
+import { MergePuddingWorld, PUDDING_COLORS, PUDDING_TIERS } from "./merge-world.js?v=20261007-play-modes1";
+import { PuddingRenderer } from "./renderer.js?v=20261007-play-modes1";
 import { FixedStepClock } from "./timing.js";
 import { FACE_ATLAS, FACE_PARTS } from "./face-atlas.js";
 
+import { FreePuddingWorld, MochiPuddingWorld } from './play-worlds.js?v=20261007-play-modes1';
+const MODE_NAMES = {free:'もちもち',mochi:'びよーん',goals:'この子をつくろう',timed:'2分チャレンジ'};
 class PuddingToy {
   constructor(root) {
     this.root = root;
@@ -27,7 +29,13 @@ class PuddingToy {
     this.resultCombo = root.querySelector("#result-combo");
     this.retryTimedButton = root.querySelector("#retry-timed-button");
     this.unlimitedButton = root.querySelector("#unlimited-button");
-    this.world = new MergePuddingWorld();
+    this.world = new FreePuddingWorld();
+    this.worlds = new Map([['free',this.world]]);
+    this.modeId = 'free';
+    this.modePicker = root.querySelector('#mode-picker');
+    this.goalCard = root.querySelector('#goal-card');
+    this.modeLabel = root.querySelector('#mode-label');
+    this.menuOpen = false;
     this.renderer = new PuddingRenderer(this.canvas, {
       debug: new URLSearchParams(location.search).has("debug"),
       lowPower: matchMedia("(prefers-reduced-motion: reduce)").matches,
@@ -103,36 +111,25 @@ class PuddingToy {
       this.cancelPointers();
       if (this.world.mode === "timed") this.world.startTimedMode(120);
       else this.world.reset(3);
-      this.announce(this.world.mode === "timed" ? "2分チャレンジをやり直します" : "3色のぷちぷりんに戻しました");
+      this.announce(this.world.mode === "timed" ? "2分チャレンジをやり直します" : "ぷりんを最初の状態に戻しました");
       this.syncControls();
       this.syncGoalDisplay(true);
       this.onResize();
     });
-    this.modeButton.addEventListener("click", () => {
-      this.cancelPointers();
-      if (this.world.mode === "timed") {
-        this.world.startUnlimitedMode();
-        this.announce("時間なしの遊びに戻りました");
-      } else {
-        this.world.startTimedMode(120);
-        this.announce("2分チャレンジ、スタート！");
+    this.modeButton.addEventListener('click', () => this.openModes());
+    this.root.querySelector('#close-modes').addEventListener('click',()=>this.closeModes());
+    this.modePicker.addEventListener('click',event=>{if(event.target===this.modePicker)this.closeModes();});
+    for(const button of this.root.querySelectorAll('[data-mode]')) button.addEventListener('click',()=>this.selectMode(button.dataset.mode));
+    this.root.addEventListener('keydown',event=>{
+      if(event.key==='Escape'&&this.menuOpen){event.preventDefault();this.closeModes();}
+      if(event.key==='Tab'&&this.menuOpen){
+        const buttons=[...this.modePicker.querySelectorAll('button')],first=buttons[0],last=buttons.at(-1);
+        if(event.shiftKey&&document.activeElement===first){event.preventDefault();last.focus();}
+        else if(!event.shiftKey&&document.activeElement===last){event.preventDefault();first.focus();}
       }
-      this.syncControls();
-      this.syncGoalDisplay(true);
-      this.onResize();
     });
-    this.retryTimedButton.addEventListener("click", () => {
-      this.world.startTimedMode(120);
-      this.syncControls();
-      this.syncGoalDisplay(true);
-      this.onResize();
-    });
-    this.unlimitedButton.addEventListener("click", () => {
-      this.world.startUnlimitedMode();
-      this.syncControls();
-      this.syncGoalDisplay(true);
-      this.onResize();
-    });
+    this.retryTimedButton.addEventListener('click',()=>{this.cancelPointers();this.world.startTimedMode(120);this.syncControls();this.syncGoalDisplay(true);this.onResize();});
+    this.unlimitedButton.addEventListener('click',()=>this.selectMode('goals'));
     this.soundButton.addEventListener("click", async () => {
       const enabled = await this.audio.toggle();
       this.soundButton.setAttribute("aria-pressed", String(enabled));
@@ -149,6 +146,31 @@ class PuddingToy {
     this.resizeObserver.observe(this.root);
   }
 
+  openModes() {
+    this.cancelPointers();this.menuOpen=true;this.world.setPaused(true);this.modePicker.hidden=false;
+    this.modeButton.setAttribute('aria-expanded','true');
+    for(const b of this.modePicker.querySelectorAll('[data-mode]'))b.setAttribute('aria-pressed',String(b.dataset.mode===this.modeId));
+    this.modePicker.querySelector('[data-mode="'+this.modeId+'"]').focus({preventScroll:true});
+  }
+  closeModes() {
+    this.menuOpen=false;this.modePicker.hidden=true;this.world.setPaused(document.hidden);
+    this.modeButton.setAttribute('aria-expanded','false');this.clock.reset(performance.now());
+    this.modeButton.focus({preventScroll:true});
+  }
+  selectMode(id) {
+    if(!MODE_NAMES[id])return;
+    this.cancelPointers();this.world.setPaused(true);
+    let world=this.worlds.get(id);
+    if(!world){
+      world=id==='free'?new FreePuddingWorld():id==='mochi'?new MochiPuddingWorld():new MergePuddingWorld();
+      world.resize(this.world.width,this.world.height,this.world.floorInset);
+      if(id==='timed')world.startTimedMode(120);else world.reset(3);
+      world.start();this.worlds.set(id,world);
+    }
+    this.world=world;this.modeId=id;this.lastRenderBodyCount=-1;this.lastGoalSignature='';this.resultWasVisible=false;
+    this.closeModes();this.syncControls();this.syncGoalDisplay(true);this.onResize();
+    this.announce(MODE_NAMES[id]+'で遊びます');
+  }
   canvasPoint(event) {
     const rect = this.canvas.getBoundingClientRect();
     return {
@@ -161,14 +183,23 @@ class PuddingToy {
     if (event.button !== 0 && event.pointerType === "mouse") return;
     event.preventDefault();
     const point = this.canvasPoint(event);
-    if (event.pointerType === "mouse" && event.shiftKey) {
+    if (this.menuOpen) return;
+    if (event.pointerType === "mouse" && event.shiftKey && this.modeId !== "mochi") {
       const children = this.world.splitAt(point.x, point.y);
       if (children) this.announce("およよっ！ ふたつに分かれました");
       return;
     }
     const body = this.world.beginDrag(event.pointerId, point.x, point.y, { time: performance.now() / 1000 });
     if (!body) return;
+    let anchorId = null;
+    if(event.pointerType==='mouse'&&event.shiftKey&&this.modeId==='mochi'){
+      anchorId='mochi-pc-anchor';
+      const c=body.particles[0],side=point.x<c.x?1:-1;
+      const p=body.particles.slice(1).reduce((best,p)=>p.x*side>best.x*side?p:best);
+      this.world.beginDrag(anchorId,p.x,p.y,{body});
+    }
     this.pointers.set(event.pointerId, {
+      anchorId,
       body,
       startedAt: performance.now(),
       startX: point.x,
@@ -221,6 +252,7 @@ class PuddingToy {
     if (!cancelled && releasedBody && duration <= 260 && pointer.maxDistance <= 13) {
       this.world.poke(releasedBody, point.x, point.y, 1);
     }
+    if(pointer.anchorId)this.world.endDrag(pointer.anchorId,{cancel:cancelled});
     this.pointers.delete(event.pointerId);
     if (this.canvas.hasPointerCapture?.(event.pointerId)) {
       try {
@@ -240,6 +272,7 @@ class PuddingToy {
       }
     }
     this.pointers.clear();
+    this.world.cancelAllDrags();
   }
 
   syncPointerReferences() {
@@ -258,7 +291,7 @@ class PuddingToy {
       this.world.setPaused(true);
       this.clock.reset(performance.now());
     } else {
-      this.world.setPaused(false);
+      this.world.setPaused(this.menuOpen);
       this.clock.reset(performance.now());
     }
   }
@@ -289,7 +322,7 @@ class PuddingToy {
 
   syncControls() {
     this.addButton.disabled = this.world.runEnded
-      || this.world.bodies.length >= this.world.addLimit;
+      || (this.world.capacityCount ?? this.world.bodies.length) >= this.world.addLimit;
     this.syncNextDropPreview();
   }
 
@@ -348,7 +381,20 @@ class PuddingToy {
     const timed = this.world.mode === "timed";
     this.timerChip.hidden = !timed;
     if (timed) this.timerChip.textContent = this.formatTime(this.world.timeRemaining);
-    this.modeButton.textContent = timed ? "∞ 通常" : "⏱ 2分";
+    this.goalCard.hidden = this.modeId === 'free' || this.modeId === 'mochi';
+    this.modeLabel.textContent = MODE_NAMES[this.modeId];
+    this.modeButton.textContent = '遊びを選ぶ';
+    this.root.dataset.mode = this.modeId;
+    if (this.displayedMode !== this.modeId) {
+    this.displayedMode = this.modeId;
+    const hints = this.root.querySelectorAll('.play-hint p');
+    hints[0].textContent = this.modeId === 'mochi' ? 'むにーっと押し合わせて、ひとつの塊に'
+      : this.modeId === 'free' ? '同じ大きさを、手でむにーっと深く押し合わせる'
+      : '同じ色・同じ大きさを、手でむにーっと深く押し合わせる';
+    hints[1].innerHTML = this.modeId === 'mochi'
+      ? '片側を持ち上げて、びよーん。放すとゆっくり戻る<span class="desktop-only">（PCは Shift＋ドラッグで両側を伸ばす）</span>'
+      : '大きい子は二本指で引っぱると分裂<span class="desktop-only">（PCは Shift＋クリック）</span>';
+    }
 
     const showResult = timed && this.world.runEnded;
     this.timeResult.hidden = !showResult;
@@ -362,7 +408,8 @@ class PuddingToy {
 
   handleWorldEvents(events) {
     for (const event of events) {
-      if (event.type === "merged") {
+      if (event.type === 'mochi-joined') { this.announce('とろーり、ひとつにつながりました');
+      } else if (event.type === "merged") {
         this.announce("とろ〜ん……ひとつ大きくなりました");
       } else if (event.type === "split") {
         this.announce("およよっ！ ふたつに分かれました");
@@ -444,7 +491,7 @@ class PuddingToy {
 }
 
 const game = new PuddingToy(document.querySelector("#game"));
-game.buildVersion = "20261006-smooth7";
+game.buildVersion = "20261007-play-modes1";
 game.initialize();
 globalThis.__puddingToy = game;
 

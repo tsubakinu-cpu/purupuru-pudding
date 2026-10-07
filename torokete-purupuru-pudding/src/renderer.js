@@ -1,7 +1,7 @@
 import { PUDDING_SPRITE } from "./assets.js";
-import { REST_RING, physicsMath } from "./physics.js?v=20261006-smooth7";
+import { REST_RING, physicsMath } from "./physics.js?v=20261007-play-modes1";
 import { FaceRig } from "./face.js";
-import { PUDDING_COLORS } from "./merge-world.js?v=20261006-smooth7";
+import { PUDDING_COLORS } from "./merge-world.js?v=20261007-play-modes1";
 
 const PLACEHOLDER_COLORS = [
   ["#ffe69b", "#e8a866", "#8a4d32"],
